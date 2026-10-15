@@ -22,21 +22,31 @@ jobs:
         uses: actions/checkout@v4
 
       # build.zig.zon links zig-curl and httpx via local paths (../zig-curl and
-      # ../httpx.zig), so check both out as siblings of the project checkout,
+      # ../httpx.zig), so both must exist as siblings of the project checkout,
       # pinned to the commits that build under Zig 0.17.
+      #
+      # actions/checkout@v4 refuses to write outside GITHUB_WORKSPACE, so each
+      # dep is checked out into ./deps/ first, then moved to its sibling slot.
       - name: Checkout zig-curl dependency
         uses: actions/checkout@v4
         with:
           repository: jiacai2050/zig-curl
           ref: ${{ env.ZIG_CURL_REF }}
-          path: ../zig-curl
+          path: deps/zig-curl
 
       - name: Checkout httpx dependency
         uses: actions/checkout@v4
         with:
           repository: muhammad-fiaz/httpx.zig
           ref: ${{ env.HTTPX_REF }}
-          path: ../httpx.zig
+          path: deps/httpx.zig
+
+      - name: Move dependencies to sibling locations
+        run: |
+          set -euo pipefail
+          deps_root="$(dirname "$GITHUB_WORKSPACE")"
+          mv "$GITHUB_WORKSPACE/deps/zig-curl" "$deps_root/zig-curl"
+          mv "$GITHUB_WORKSPACE/deps/httpx.zig" "$deps_root/httpx.zig"
 
       # The build links against the system libcurl (link_vendor = false).
       - name: Install libcurl
