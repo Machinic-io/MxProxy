@@ -37,11 +37,101 @@ pub fn handle(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) vo
     };
 }
 
-const BodyMode = enum { none, socket, buffer };
+const BodyMode = enum { none, socket, chunked };
+
+/// Bounded, streaming decode of a chunked request body. Raw bytes are read from
+/// the socket in bounded chunks, decoded in place, and the decoded payload is
+/// handed to libcurl on demand. Memory is bounded to `work_cap` + `decoded_cap`
+/// regardless of the (unbounded) body size: the client's chunked framing is
+/// decoded and re-emitted, so the upstream sees a chunked (HTTP/1.1) / unframed
+/// (HTTP/2) upload rather than a Content-Length one.
+const ChunkedStream = struct {
+    socket: *const tcp.Socket,
+    allocator: std.mem.Allocator,
+    decoder: parser.ChunkedDecoder,
+    work: []u8, // raw bytes read from the socket (capacity work_cap).
+    work_len: usize,
+    decoded: []u8, // decoded payload not yet served, kept at the front.
+    dec_len: usize,
+    done: bool, // terminating chunk reached.
+
+    const work_cap = 64 * 1024;
+    const decoded_cap = 128 * 1024;
+
+    fn init(allocator: std.mem.Allocator, socket: *const tcp.Socket, seed: []const u8) !*ChunkedStream {
+        const cs = try allocator.create(ChunkedStream);
+        errdefer allocator.destroy(cs);
+        cs.allocator = allocator;
+        cs.socket = socket;
+        cs.decoder = parser.ChunkedDecoder.init();
+        cs.work = try allocator.alloc(u8, work_cap);
+        errdefer allocator.free(cs.work);
+        cs.decoded = try allocator.alloc(u8, decoded_cap);
+        errdefer allocator.free(cs.decoded);
+        cs.dec_len = 0;
+        cs.done = false;
+        if (seed.len > 0) {
+            // `seed` is the tail (body bytes read with the head), <= 64 KiB.
+            if (seed.len > work_cap) return error.Bug;
+            @memcpy(cs.work[0..seed.len], seed);
+            cs.work_len = seed.len;
+        } else {
+            cs.work_len = 0;
+        }
+        return cs;
+    }
+
+    fn deinit(self: *ChunkedStream) void {
+        self.allocator.free(self.work);
+        self.allocator.free(self.decoded);
+        self.allocator.destroy(self);
+    }
+
+    /// Read up to `out.len` decoded bytes into `out`, reading from the socket
+    /// and decoding as needed. Returns 0 on EOF (terminating chunk reached and
+    /// all payload served).
+    fn read(self: *ChunkedStream, out: []u8) !usize {
+        while (!self.done and self.dec_len < out.len and self.dec_len + work_cap <= self.decoded.len) {
+            try self.decodeMore();
+        }
+        const want = @min(self.dec_len, out.len);
+        if (want == 0) return 0;
+        @memcpy(out[0..want], self.decoded[0..want]);
+        const keep = self.dec_len - want;
+        if (keep > 0) std.mem.copyForwards(u8, self.decoded[0..keep], self.decoded[want..self.dec_len]);
+        self.dec_len = keep;
+        return want;
+    }
+
+    /// Decode the buffered raw bytes, append the decoded payload to `decoded`,
+    /// compact the raw remainder, and read more raw so the next call progresses.
+    fn decodeMore(self: *ChunkedStream) !void {
+        const res = self.decoder.decode(self.work[0..self.work_len]);
+        if (res) |_| {
+            self.done = true; // terminating chunk reached.
+        } else |err| {
+            if (err != parser.ParseError.Incomplete) return error.BadRequest; // malformed
+            // Incomplete: keep reading; not done yet.
+        }
+        const decoded_len = self.decoder.decodedLen;
+        const consumed = self.decoder.rawConsumed;
+        if (decoded_len > 0) {
+            @memcpy(self.decoded[self.dec_len..][0..decoded_len], self.work[0..decoded_len]);
+            self.dec_len += decoded_len;
+        }
+        const keep = self.work_len - consumed;
+        if (keep > 0) std.mem.copyForwards(u8, self.work[0..keep], self.work[consumed..self.work_len]);
+        self.work_len = keep;
+        if (self.done) return;
+        const n = self.socket.read(self.work[self.work_len..]) catch return error.ClientClosed;
+        if (n == 0) return error.ChunkedBodyIncomplete; // EOF before terminating chunk
+        self.work_len += n;
+    }
+};
 
 /// Per-connection state shared with the three libcurl callbacks. `tail` and
-/// `body_buffer` are owned here (freed in deinit); `socket`/`response_overrides`
-/// borrow from the caller.
+/// `chunked_stream` are owned here (freed in deinit); `socket`/
+/// `response_overrides` borrow from the caller.
 const Ctx = struct {
     socket: *const tcp.Socket,
     allocator: std.mem.Allocator,
@@ -49,8 +139,7 @@ const Ctx = struct {
     tail: []const u8,
     tail_pos: usize,
     body_remaining: usize,
-    body_buffer: []const u8,
-    body_buffer_pos: usize,
+    chunked_stream: ?*ChunkedStream,
     head_buf: std.array_list.Managed(u8),
     head_done: bool,
     response_status: u16,
@@ -66,7 +155,7 @@ const Ctx = struct {
 
     fn deinit(self: *Ctx) void {
         if (self.tail.len > 0) self.allocator.free(self.tail);
-        if (self.body_buffer.len > 0) self.allocator.free(self.body_buffer);
+        if (self.chunked_stream) |cs| cs.deinit();
         self.head_buf.deinit();
     }
 
@@ -93,13 +182,9 @@ const Ctx = struct {
                 self.body_remaining -= n;
                 return n;
             },
-            .buffer => {
-                const avail = self.body_buffer.len - self.body_buffer_pos;
-                const want = @min(avail, out.len);
-                if (want == 0) return 0;
-                @memcpy(out[0..want], self.body_buffer[self.body_buffer_pos..][0..want]);
-                self.body_buffer_pos += want;
-                return want;
+            .chunked => {
+                const cs = self.chunked_stream orelse return error.Bug;
+                return cs.read(out);
             },
         }
     }
@@ -113,6 +198,13 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
     var fields: [parser.DEFAULT_MAX_HEADERS]parser.Field = undefined;
     var blk: parser.HeaderBlockResult = undefined;
     read_head: while (true) {
+        if (total == head_buf.len) {
+            // The head is larger than the fixed read buffer. Reject it rather
+            // than reading an empty buffer and misreporting it as a close.
+            try writeError(socket, allocator, 431);
+            if (self.verbose) log.info("[proxy] request head too large (>64 KiB) -> 431", .{});
+            return;
+        }
         const n = socket.read(head_buf[total..]) catch return error.ClientClosed;
         if (n == 0) return error.ClientClosed;
         total += n;
@@ -162,15 +254,17 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
         .tail = &.{},
         .tail_pos = 0,
         .body_remaining = 0,
-        .body_buffer = &.{},
-        .body_buffer_pos = 0,
+        .chunked_stream = null,
         .head_buf = std.array_list.Managed(u8).init(allocator),
         .head_done = false,
         .response_status = 0,
         .response_overrides = &upstream.response_headers.map,
         .default_origin = self.config.default_origin,
     };
-    errdefer ctx.deinit();
+    // defer (not errdefer): the happy path falls off the end of forward()
+    // without returning an error, so errdefer would skip this and leak
+    // tail/body_buffer/head_buf on every successful request.
+    defer ctx.deinit();
 
     if (tail_start < total) {
         const tail_bytes = try allocator.alloc(u8, total - tail_start);
@@ -193,10 +287,11 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
             }
         },
         .chunked => {
-            // Buffer+decode the whole chunked body (non-streaming).
-            ctx.body_buffer = try readChunkedBody(allocator, socket, ctx.tail);
-            ctx.body_mode = .buffer;
-            ctx.body_remaining = ctx.body_buffer.len;
+            // Stream+decode the chunked body in bounded chunks (no total
+            // buffering). The tail seeds the decoder; the rest is pulled from
+            // the socket on demand via the read callback.
+            ctx.body_mode = .chunked;
+            ctx.chunked_stream = try ChunkedStream.init(allocator, socket, ctx.tail);
             if (ctx.tail.len > 0) {
                 allocator.free(ctx.tail);
                 ctx.tail = &.{};
@@ -219,8 +314,9 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
     const method_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{ method }, 0);
     defer allocator.free(method_z);
     // "auto" may fall back to HTTP/1.1, but only when the request body is
-    // re-sendable (a .socket body is consumed from the client on the first pass).
-    const can_fallback = std.mem.eql(u8, upstream.protocol, "auto") and ctx.body_mode != .socket;
+    // re-sendable. Both .socket and .chunked consume the client socket on the
+    // first pass, so only a bodyless request can be retried.
+    const can_fallback = std.mem.eql(u8, upstream.protocol, "auto") and ctx.body_mode == .none;
     var use_fallback: bool = false;
     while (true) {
         const http_version: curl.Easy.HttpVersion = if (use_fallback)
@@ -245,7 +341,7 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
         };
         break;
     }
-    log.info("[proxy] {s:<4} {s:<32} -> {s:<32} {d} ({d}us)", .{ method, path, remote_path, ctx.response_status, elapsedUs(start, socket.io) });
+    log.info("{s:<4} {s:<32} -> {s:<32} {d} ({d}us)", .{ method, path, remote_path, ctx.response_status, elapsedUs(start, socket.io) });
 }
 
 /// Configure a fresh easy handle and run one transfer attempt at `http_version`.
@@ -302,7 +398,12 @@ fn attempt(
     if (slist) |s| try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_HTTPHEADER, s), &diag);
     if (ctx.body_mode != .none) {
         try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_UPLOAD, @as(c_long, 1)), &diag);
-        try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_INFILESIZE_LARGE, @as(c_long, @intCast(ctx.body_remaining))), &diag);
+        // A .socket body has a known size (declared Content-Length); a .chunked
+        // body does not, so we omit INFILESIZE and let libcurl re-frame the
+        // upload as chunked (HTTP/1.1) / unframed (HTTP/2).
+        if (ctx.body_mode == .socket) {
+            try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_INFILESIZE_LARGE, @as(c_long, @intCast(ctx.body_remaining))), &diag);
+        }
         try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_READFUNCTION, readCallback), &diag);
         try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_READDATA, ctx), &diag);
     }
@@ -325,16 +426,14 @@ fn firstProtocol(protocol: []const u8) curl.Easy.HttpVersion {
 }
 
 /// Reset the per-attempt state so an HTTP/1.1 fallback re-runs the transfer
-/// with a clean slate. Only safe when the request body is re-sendable (the
-/// caller guarantees `body_mode != .socket`).
+/// with a clean slate. Only called for a re-sendable (bodyless) request, so
+/// there is no body state to rewind.
 fn resetForRetry(ctx: *Ctx) void {
     ctx.head_done = false;
     ctx.response_status = 0;
     ctx.curl_error = null;
     ctx.head_buf.clearRetainingCapacity();
-    ctx.body_buffer_pos = 0;
     ctx.tail_pos = 0;
-    ctx.body_remaining = ctx.body_buffer.len;
 }
 
 /// Microseconds elapsed between `start` and now, read from the same clock.
@@ -410,67 +509,19 @@ fn fixHttp2Head(allocator: std.mem.Allocator, head: []const u8) ![]u8 {
     return buf.toOwnedSlice();
 }
 
-/// Buffer and fully decode a chunked request body, returning the decoded
-/// payload. `seed` holds the body bytes already read with the head; the rest is
-/// read from the socket until the terminating chunk.
-fn readChunkedBody(allocator: std.mem.Allocator, socket: *const tcp.Socket, seed: []const u8) ![]u8 {
-    var work: []u8 = try allocator.alloc(u8, 16384);
-    errdefer allocator.free(work);
-    var work_len: usize = 0;
-    var payload = std.array_list.Managed(u8).init(allocator);
-    errdefer payload.deinit();
-    if (seed.len > 0) {
-        work = try ensureCap(work, 0, seed.len, allocator);
-        @memcpy(work[0..seed.len], seed);
-        work_len = seed.len;
-    }
-    var decoder = parser.ChunkedDecoder.init();
-    while (true) {
-        var done = false;
-        const res = decoder.decode(work[0..work_len]);
-        if (res) |_| {
-            done = true;
-        } else |err| {
-            if (err != parser.ParseError.Incomplete) return err;
-            // Incomplete: keep `done` false and read more below.
-        }
-        const decoded = decoder.decodedLen;
-        const consumed = decoder.rawConsumed;
-        if (decoded > 0) try payload.appendSlice(work[0..decoded]);
-        // Drop the consumed prefix; the unconsumed remainder becomes the seed
-        // for the next round.
-        const keep = work_len - consumed;
-        if (keep > 0) std.mem.copyForwards(u8, work[0..keep], work[consumed..work_len]);
-        work_len = keep;
-        if (done) break;
-        work = try ensureCap(work, work_len, work_len + 8192, allocator);
-        const n = socket.read(work[work_len..]) catch return error.ClientClosed;
-        if (n == 0) return error.ChunkedBodyIncomplete;
-        work_len += n;
-    }
-    return payload.toOwnedSlice();
-}
-
-fn ensureCap(buf: []u8, used: usize, want: usize, allocator: std.mem.Allocator) ![]u8 {
-    if (buf.len >= want) return buf;
-    var cap = buf.len;
-    while (cap < want) cap *= 2;
-    const newbuf = try allocator.alloc(u8, cap);
-    @memcpy(newbuf[0..used], buf[0..used]);
-    allocator.free(buf);
-    return newbuf;
-}
-
 fn writeError(socket: *const tcp.Socket, allocator: std.mem.Allocator, code: u16) !void {
     const reason_phrase = switch (code) {
         400 => "Bad Request",
         404 => "Not Found",
+        431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         else => "Error",
     };
     var buf = std.array_list.Managed(u8).init(allocator);
-    errdefer buf.deinit();
+    // defer (not errdefer): the success path writes the body and returns void,
+    // so errdefer would skip this and leak buf on every error response.
+    defer buf.deinit();
     const sl = try std.fmt.allocPrint(allocator, "HTTP/1.1 {d} {s}\r\n", .{ code, reason_phrase });
     defer allocator.free(sl);
     try buf.appendSlice(sl);

@@ -39,7 +39,10 @@ fn valueAfter(arg: []const u8) []const u8 {
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const allocator = init.arena.allocator();
+    // The page allocator frees individual allocations (unlike the process
+    // arena, whose free is a no-op), so per-request state allocated through it
+    // is returned to the OS as requests complete instead of accumulating.
+    const allocator = std.heap.page_allocator;
 
     // Collect command-line arguments, skipping the executable name.
     var arg_it = init.minimal.args.iterate();
@@ -116,10 +119,11 @@ pub fn main(init: std.process.Init) !void {
     if (interface_override) |i| config.interface = i;
     if (verbose_upstream) config.verbose_upstream = true;
 
-    // Process-lifetime ownership (Option A): the config (above) and the
-    // forwarder (below) live on the process arena and are never freed, so
-    // in-flight request threads keep valid references until process exit (the
-    // runtime reclaims everything at exit).
+    // The config (above) and the forwarder (below) are process-lifetime: they
+    // are allocated from `allocator` and never freed (reclaimed at exit), so
+    // in-flight request threads keep valid references. Per-request allocations
+    // also use `allocator` but are freed on every request, so the working set
+    // stays bounded to in-flight requests rather than growing without bound.
     try curl.globalInit();
 
     if (verbose) {

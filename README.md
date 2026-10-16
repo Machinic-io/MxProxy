@@ -21,6 +21,31 @@ A fast, lightweight HTTP **reverse proxy** written in [Zig](https://ziglang.org)
 
 `MxProxy` runs an accept loop and spawns a thread per connection. Each request is parsed (HTTP/1.1 request line + headers), resolved to an upstream and a rewritten path, and handed to libcurl. The response head is relayed to the client (hop-by-hop headers stripped, overrides and CORS applied) and the body is streamed as libcurl receives it.
 
+```mermaid
+flowchart TD
+    A([Client request]) --> B[Accept loop<br/>one thread per connection]
+    B --> C[Parse HTTP/1.1 request line + headers]
+    C --> D[Resolve upstream + rewrite path]
+    D --> E[Build request headers<br/>drop hop-by-hop, apply overrides + CORS]
+    E --> F{Request body?}
+    F -->|none| G[no body]
+    F -->|Content-Length| H[streamed, bounded]
+    F -->|chunked| I[decoded on the fly, bounded]
+    G --> TRANSFER
+    H --> TRANSFER
+    I --> TRANSFER
+    subgraph TRANSFER ["libcurl transfer: http1 / http2 / auto"]
+        direction TB
+        R1[read callback: supply request body, 0 when bodyless]
+        R2[header callback: relay response head<br/>strip hop-by-hop, apply overrides + CORS]
+        R3[write callback: stream response body]
+        R1 --> R2 --> R3
+    end
+    TRANSFER --> FB{"auto, failed before any bytes,<br/>body re-sendable?"}
+    FB -->|yes: retry HTTP/1.1| TRANSFER
+    FB -->|no| Z([Response sent])
+```
+
 The pipeline is split across a few focused modules:
 
 | Module | Responsibility |

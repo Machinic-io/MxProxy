@@ -112,11 +112,15 @@ pub const Server = struct {
                 socket.close();
                 return; // shutdown requested
             }
-            _ = std.Thread.spawn(.{}, handleConn, .{ self.forwarder, self.allocator, socket }) catch {
+            const t = std.Thread.spawn(.{}, handleConn, .{ self.forwarder, self.allocator, socket }) catch {
                 socket.close();
                 log.err("failed to spawn connection thread", .{});
                 continue;
             };
+            // Detach: this thread is fire-and-forget (one connection), so we
+            // never join it. Detaching releases the pthread's resources when it
+            // exits, instead of leaking a zombie joinable thread per connection.
+            t.detach();
         }
     }
 };

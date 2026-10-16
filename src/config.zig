@@ -186,22 +186,27 @@ pub const Config = struct {
         };
         cfg.* = .{ .arena = arena };
         errdefer cfg.arena.deinit();
+        // The arena is copied into cfg above; allocating the rest through the
+        // local `a` would append chunks to the local arena's list, leaving
+        // cfg.arena a stale snapshot so cfg.arena.deinit() would leak them on
+        // an error return. Parse through cfg.arena so its list is complete.
+        const ca = cfg.arena.allocator();
 
         var from_file = RawConfig{};
         if (file_path) |path| {
             const dir = std.Io.Dir.cwd();
-            const text = dir.readFileAlloc(io, path, a, .unlimited) catch |err| {
+            const text = dir.readFileAlloc(io, path, ca, .unlimited) catch |err| {
                 if (err == error.FileNotFound) return ConfigError.ConfigFileNotFound;
                 return err;
             };
-            from_file = try std.json.parseFromSliceLeaky(RawConfig, a, text, .{
+            from_file = try std.json.parseFromSliceLeaky(RawConfig, ca, text, .{
                 .allocate = .alloc_always,
             });
         }
 
         var from_str = RawConfig{};
         if (json_str) |s| {
-            from_str = try std.json.parseFromSliceLeaky(RawConfig, a, s, .{
+            from_str = try std.json.parseFromSliceLeaky(RawConfig, ca, s, .{
                 .allocate = .alloc_always,
             });
         }

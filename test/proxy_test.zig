@@ -969,6 +969,173 @@ test "integration: relay GET with a Content-Length body" {
 }
 
 // ---------------------------------------------------------------------------
+// Chunked relay: a client chunked body is decoded and re-emitted to the
+// upstream as chunked (no Content-Length), streamed in bounded memory. The
+// payload is larger than the proxy's 128 KiB decoded buffer so the streaming
+// (multi-read) path is exercised, not just "fits in one buffer".
+// ---------------------------------------------------------------------------
+
+/// Frame `chunks` as an HTTP chunked body: <hex-size>\r\n<data>\r\n ... 0\r\n\r\n
+fn buildChunkedBody(allocator: std.mem.Allocator, chunks: []const []const u8) ![]u8 {
+    var buf = std.array_list.Managed(u8).init(allocator);
+    errdefer buf.deinit();
+    for (chunks) |c| {
+        const hex = std.fmt.allocPrint(allocator, "{x}", .{ c.len }) catch return error.OutOfMemory;
+        defer allocator.free(hex);
+        try buf.appendSlice(hex);
+        try buf.appendSlice("\r\n");
+        try buf.appendSlice(c);
+        try buf.appendSlice("\r\n");
+    }
+    try buf.appendSlice("0\r\n\r\n");
+    return buf.toOwnedSlice();
+}
+
+/// Upstream handler for a chunked request: read the head, confirm it is
+/// chunked (not Content-Length), decode the chunked body, and echo the framing
+/// plus the decoded length.
+fn serveUpstreamChunked(socket: tcp.Socket, allocator: std.mem.Allocator) void {
+    defer socket.close();
+
+    var head: [16384]u8 = undefined;
+    var head_total: usize = 0;
+    var seed_start: usize = 0;
+    var is_chunked = false;
+    head: while (true) {
+        if (std.mem.indexOf(u8, head[0..head_total], "\r\n\r\n")) |blank| {
+            const head_bytes = head[0 .. blank + 4];
+            const head_res = parser.parseRequestHead(head_bytes, .{}) catch return;
+            var fields: [parser.DEFAULT_MAX_HEADERS]parser.Field = undefined;
+            const blk = parser.parseHeaderBlock(head_bytes, head_res.headEnd, &fields, .{}) catch return;
+            for (fields[0..blk.count]) |f| {
+                if (std.ascii.eqlIgnoreCase(f.name, "Transfer-Encoding") and std.mem.indexOf(u8, f.value, "chunked") != null) {
+                    is_chunked = true;
+                }
+            }
+            seed_start = blank + 4;
+            break :head;
+        }
+        const n = socket.read(head[head_total..]) catch return;
+        if (n == 0) return;
+        head_total += n;
+    }
+
+    var decoded_total: usize = 0;
+    var ok: bool = true;
+    var work: [65536]u8 = undefined;
+    var work_len: usize = 0;
+    if (seed_start < head_total) {
+        const seed_len = head_total - seed_start;
+        @memcpy(work[0..seed_len], head[seed_start..head_total]);
+        work_len = seed_len;
+    }
+    var decoder = parser.ChunkedDecoder.init();
+    while (true) {
+        const res = decoder.decode(work[0..work_len]);
+        decoded_total += decoder.decodedLen;
+        if (res) |_| {
+            break; // terminating chunk reached.
+        } else |err| {
+            if (err != parser.ParseError.Incomplete) {
+                ok = false;
+                break;
+            }
+        }
+        const keep = work_len - decoder.rawConsumed;
+        if (keep > 0) std.mem.copyForwards(u8, work[0..keep], work[decoder.rawConsumed..work_len]);
+        work_len = keep;
+        const n = socket.read(work[work_len..]) catch return;
+        if (n == 0) {
+            ok = false; // EOF before the terminating chunk.
+            break;
+        }
+        work_len += n;
+    }
+
+    const framing = if (is_chunked) "chunked" else "other";
+    const ok_val: u32 = if (ok) 1 else 0;
+    const body = std.fmt.allocPrint(allocator, "framing={s} bodylen={d} ok={d}\n", .{ framing, decoded_total, ok_val }) catch return;
+    defer allocator.free(body);
+    const resp = std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Marker: up\r\nX-Framing: {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ framing, body.len, body }) catch return;
+    defer allocator.free(resp);
+    socket.writeAll(resp) catch return;
+}
+
+fn serveUpstreamChunkedOnce(listener: *tcp.Listener, io: std.Io, allocator: std.mem.Allocator) void {
+    const socket = listener.accept(io) catch return;
+    serveUpstreamChunked(socket, allocator);
+}
+
+/// Relay `request` through the proxy against a chunked-aware upstream and
+/// return the full response bytes.
+fn relayChunkedRequest(io: std.Io, allocator: std.mem.Allocator, request: []const u8) ![]u8 {
+    var upstream = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
+    defer upstream.close(io);
+    const upstream_port = upstream.localPort();
+
+    const upstream_host = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{ upstream_port });
+    defer allocator.free(upstream_host);
+    const cfg_json = try std.fmt.allocPrint(allocator, "{{\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{ upstream_host });
+    defer allocator.free(cfg_json);
+    var cfg = try Config.load(io, allocator, null, cfg_json);
+    defer cfg.deinit();
+    var forwarder = try forward_mod.Forwarder.init(cfg, false);
+
+    var proxy = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
+    defer proxy.close(io);
+    const proxy_port = proxy.localPort();
+
+    const up_thread = try std.Thread.spawn(.{}, serveUpstreamChunkedOnce, .{ &upstream, io, allocator });
+    const proxy_thread = try std.Thread.spawn(.{}, proxyOnce, .{ &proxy, io, allocator, &forwarder });
+
+    var client = tcp.connect(io, "127.0.0.1", proxy_port) catch return IntError.ConnectFailed;
+    defer client.close();
+    client.writeAll(request) catch return IntError.RelayFailed;
+    var resp = std.array_list.Managed(u8).init(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = client.read(&chunk) catch break;
+        if (n == 0) break;
+        try resp.appendSlice(chunk[0..n]);
+    }
+
+    up_thread.join();
+    proxy_thread.join();
+
+    return resp.toOwnedSlice();
+}
+
+test "integration: relay a chunked body (chunked in -> chunked out)" {
+    const allocator = std.heap.page_allocator;
+    var io_ctx = try httpx.IoContext.init(std.testing.allocator);
+    defer io_ctx.deinit();
+
+    // 300 KiB payload (> the 128 KiB decoded buffer) split into a few chunks.
+    const body_size: usize = 300 * 1024;
+    const payload = try allocator.alloc(u8, body_size);
+    defer allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @as(u8, @intCast(i % 251));
+    const chunked_body = try buildChunkedBody(allocator, &.{
+        payload[0..100 * 1024],
+        payload[100 * 1024 .. 250 * 1024],
+        payload[250 * 1024..],
+    });
+    defer allocator.free(chunked_body);
+
+    const request = try std.mem.concat(allocator, u8, &.{
+        "POST /chunked HTTP/1.1\r\nHost: local\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\n\r\n",
+        chunked_body,
+    });
+    defer allocator.free(request);
+    const resp = try relayChunkedRequest(io_ctx.io, allocator, request);
+
+    try std.testing.expect(std.mem.indexOf(u8, resp, "HTTP/1.1 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "X-Framing: chunked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "bodylen=307200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "ok=1") != null);
+}
+
+// ---------------------------------------------------------------------------
 // Concurrency test: submit N parallel requests and verify the proxy handles
 // them all at once. The proxy is driven the same way production runs it
 // (thread-per-connection in an accept loop, like server.zig). A barrier in the
@@ -978,31 +1145,35 @@ test "integration: relay GET with a Content-Length body" {
 
 const N_CONCURRENT: usize = 10;
 /// 0.17 removed std.time timestamps, so the barrier's give-up deadline is a
-/// spin count rather than a wall-clock timeout (~1e9 spins is on the order of a
-/// second). The concurrent case reaches the barrier in milliseconds and exits
-/// the spin early, so this only bounds how long a NON-concurrent proxy keeps a
-/// handler waiting before the test fails instead of hanging. It must comfortably
-/// exceed the stagger between the N handler threads starting, or a healthy proxy
-/// can be misreported as serial.
-const BARRIER_MAX_SPINS: u32 = 1_000_000_000;
+/// yield count rather than a wall-clock timeout. Each wait iteration yields the
+/// CPU (std.Thread.yield), so a handler waiting at the barrier never starves the
+/// other handler threads that still have to reach it. This matters on a small,
+/// contended runner (CI): a tight spin there hogs a core and the N-1 stragglers
+/// never make progress in time, so a healthy concurrent proxy gets misreported
+/// as not reaching the barrier. The budget bounds how long a NON-concurrent
+/// proxy keeps a handler waiting before the test fails instead of hanging; it
+/// must comfortably exceed the stagger between the N handler threads arriving,
+/// or a healthy proxy can be misreported as serial.
+const BARRIER_MAX_YIELDS: u32 = 10_000_000;
 var in_flight: usize = 0;
 var barrier_reached: bool = true;
 
 /// Upstream handler with a concurrency barrier: read the request, count
-/// ourselves in flight, and block until all N_CONCURRENT are in flight at once
-/// (proving the proxy handled them concurrently). If the proxy is not
-/// concurrent the barrier is never reached; after BARRIER_MAX_SPINS we mark it
-/// unreached so the test fails instead of hanging.
+/// ourselves in flight, and (cooperatively) wait until all N_CONCURRENT are in
+/// flight at once (proving the proxy handled them concurrently). If the proxy is
+/// not concurrent the barrier is never reached; after BARRIER_MAX_YIELDS we mark
+/// it unreached so the test fails instead of hanging.
 fn serveUpstreamBarrier(socket: tcp.Socket, allocator: std.mem.Allocator) void {
     const cl = readUpstreamRequest(socket);
     _ = @atomicRmw(usize, &in_flight, .Add, 1, .monotonic);
-    var spins: u32 = 0;
+    var yields: u32 = 0;
     while (@atomicLoad(usize, &in_flight, .monotonic) < N_CONCURRENT) {
-        if (spins >= BARRIER_MAX_SPINS) {
+        if (yields >= BARRIER_MAX_YIELDS) {
             @atomicStore(bool, &barrier_reached, false, .monotonic);
             break;
         }
-        spins += 1;
+        std.Thread.yield() catch {};
+        yields += 1;
     }
     // The handler always runs to completion (readUpstreamRequest /
     // respondUpstream swallow their errors), so decrement + close on the
@@ -1059,7 +1230,12 @@ test "integration: N concurrent requests are all in flight at once" {
     const upstream_port = upstream.localPort();
     const upstream_host = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{upstream_port});
     defer allocator.free(upstream_host);
-    const cfg_json = try std.fmt.allocPrint(allocator, "{{\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
+    // The upstream handlers hold their connection at the barrier until all N
+    // requests are in flight, so the proxy's libcurl transfers wait that long
+    // for a response. Give the transfer a generous timeout so a contended
+    // runner (slow barrier) can't trip the default 10s timeout and 502 the
+    // requests before the barrier is reached.
+    const cfg_json = try std.fmt.allocPrint(allocator, "{{\"timeout_ms\":60000,\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
     defer allocator.free(cfg_json);
     var cfg = try Config.load(io, allocator, null, cfg_json);
     defer cfg.deinit();

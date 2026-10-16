@@ -9,7 +9,7 @@
 # Resolution order:
 #   1. $ZIG_17 if set and it reports 0.17.x
 #   2. the default `zig` if it already reports 0.17.x
-#   3. a known local 0.17 toolchain (e.g. the zig snap revision 17037)
+#   3. a known local 0.17 toolchain (snap, Homebrew, Nix, or a tarball in $HOME)
 set -euo pipefail
 
 is17() {
@@ -27,10 +27,14 @@ fi
 
 if command -v zig >/dev/null 2>&1 && is17 zig; then exec zig "$@"; fi
 
-for cand in /snap/zig/*/zig /snap/zig/*/bin/zig; do
+# Look for zig in common places
+for cand in /snap/zig/*/zig /snap/zig/*/bin/zig \
+            /opt/homebrew/bin/zig /opt/homebrew/Cellar/zig/*/bin/zig \
+            /usr/local/bin/zig /usr/local/Cellar/zig/*/bin/zig \
+            "$HOME/.nix-profile/bin/zig" "$HOME"/zig-*/zig; do
   [ -x "$cand" ] || continue
   if is17 "$cand"; then exec "$cand" "$@"; fi
 done
 
-echo "error: no Zig 0.17 toolchain found; set ZIG_17 to its path (e.g. /snap/zig/17037/zig)" >&2
+echo "error: no Zig 0.17 toolchain found (searched PATH, snap, Homebrew, Nix, \$HOME); set ZIG_17 to the path of your 0.17 zig" >&2
 exit 1
