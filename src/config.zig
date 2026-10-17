@@ -9,6 +9,11 @@ pub const ConfigError = error{
     UpstreamHostConflict,
     ConfigFileNotFound,
     InvalidConfig,
+    /// The overall timeout must be greater than the connect timeout (see
+    /// validate). Connect >= overall is meaningless (the connect budget would
+    /// already cap the transfer) and makes the timeout-kind heuristic
+    /// ambiguous.
+    ConnectTimeoutNotLessThanOverall,
 };
 
 /// Header overrides for a single direction.
@@ -29,7 +34,11 @@ pub const HeaderOverrides = std.json.ArrayHashMap(?[]const u8);
 /// absolute path (see `Router.splicedPath`), so a root remote never doubles
 /// the leading slash.
 pub const PathMapping = struct {
-    @"type": []const u8,
+    /// Match type, defaulting to `"plain"` when the key is absent from the
+    /// JSON so an omitted type is a valid plain rule. The only supported type
+    /// today; an explicit other value still fails validation (see
+    /// `Config.validate`).
+    @"type": []const u8 = "plain",
     local: []const u8,
     remote: []const u8 = "",
 };
@@ -42,8 +51,12 @@ pub const Upstream = struct {
     /// the top-level default interface.
     interface: ?[]const u8 = null,
 
-    /// Upstream request timeout in milliseconds. `null` means inherit the
-    /// top-level default timeout (see `Config.timeout_ms`).
+    /// Upstream connect timeout in milliseconds (TCP/TLS handshake). `null`
+    /// means inherit the top-level default connect timeout
+    /// (see `Config.connect_timeout_ms`).
+    connect_timeout_ms: ?usize = null,
+    /// Upstream overall (total transfer) timeout in milliseconds. `null` means
+    /// inherit the top-level default overall timeout (see `Config.timeout_ms`).
     timeout_ms: ?usize = null,
     /// Skip TLS certificate verification. `null` means inherit the top-level
     /// default (see `Config.insecure`).
@@ -68,8 +81,14 @@ pub const Upstream = struct {
         return self.interface orelse default;
     }
 
-    /// The effective upstream request timeout in milliseconds, falling back to
-    /// `default` (the top-level default timeout).
+    /// The effective upstream connect timeout in milliseconds, falling back to
+    /// `default` (the top-level default connect timeout).
+    pub fn effectiveConnectTimeoutMs(self: *const Upstream, default: usize) usize {
+        return self.connect_timeout_ms orelse default;
+    }
+
+    /// The effective upstream overall (total transfer) timeout in milliseconds,
+    /// falling back to `default` (the top-level default overall timeout).
     pub fn effectiveTimeoutMs(self: *const Upstream, default: usize) usize {
         return self.timeout_ms orelse default;
     }
@@ -103,6 +122,7 @@ const RawConfig = struct {
     bind_address: ?[]const u8 = null,
     interface: ?[]const u8 = null,
     timeout_ms: ?usize = null,
+    connect_timeout_ms: ?usize = null,
     insecure: ?bool = null,
     upstream: ?[]Upstream = null,
 };
@@ -134,9 +154,12 @@ pub const Config = struct {
     bind_address: ?[]const u8 = null,
     /// Default upstream-facing interface (see `Upstream.interface`).
     interface: ?[]const u8 = null,
-    /// Default upstream request timeout in milliseconds (see
+    /// Default overall (total transfer) upstream timeout in milliseconds (see
     /// `Upstream.timeout_ms`). Set by `--timeout`.
-    timeout_ms: usize = 10000,
+    timeout_ms: usize = 900000,
+    /// Default upstream connect timeout in milliseconds (TCP/TLS handshake; see
+    /// `Upstream.connect_timeout_ms`). Set by `--connect-timeout`.
+    connect_timeout_ms: usize = 10000,
     /// Default for skipping TLS certificate verification (see
     /// `Upstream.insecure`). Set by `--insecure`.
     insecure: bool = false,
@@ -214,7 +237,8 @@ pub const Config = struct {
         cfg.port = from_str.port orelse from_file.port orelse 8080;
         cfg.bind_address = from_str.bind_address orelse from_file.bind_address;
         cfg.interface = from_str.interface orelse from_file.interface;
-        cfg.timeout_ms = from_str.timeout_ms orelse from_file.timeout_ms orelse 10000;
+        cfg.timeout_ms = from_str.timeout_ms orelse from_file.timeout_ms orelse 900000;
+        cfg.connect_timeout_ms = from_str.connect_timeout_ms orelse from_file.connect_timeout_ms orelse 10000;
         cfg.insecure = from_str.insecure orelse from_file.insecure orelse false;
         cfg.upstream = from_str.upstream orelse from_file.upstream orelse &.{};
 
@@ -225,8 +249,17 @@ pub const Config = struct {
     pub fn validate(self: *const Self) !void {
         if (self.port == 0) return ConfigError.InvalidPort;
 
+        // The overall (total transfer) timeout must exceed the connect timeout.
+        // Checked at the top level (covers the catch-all upstream added by
+        // --upstream-host, which inherits these defaults) and per-upstream for
+        // the resolved effective values.
+        if (self.timeout_ms <= self.connect_timeout_ms) return ConfigError.ConnectTimeoutNotLessThanOverall;
+
         for (self.upstream) |u| {
             try validateHost(u.host);
+            if (u.effectiveTimeoutMs(self.timeout_ms) <= u.effectiveConnectTimeoutMs(self.connect_timeout_ms)) {
+                return ConfigError.ConnectTimeoutNotLessThanOverall;
+            }
             for (u.path) |p| {
                 if (!std.mem.eql(u8, p.@"type", "plain")) return ConfigError.InvalidPathType;
                 // A blank local (like "/") matches any path, and a blank remote

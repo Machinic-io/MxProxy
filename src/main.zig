@@ -23,7 +23,8 @@ const USAGE =
     "  --config-json=<json>                       Inline JSON config (top-level keys)\n" ++
     "  --port=<port>                              Listen port (default: 8080)\n" ++
     "  --bind=<ip>                                Listen address (default: all interfaces)\n" ++
-    "  --timeout=<ms>                             Default upstream request timeout (default: 10000)\n" ++
+    "  --timeout=<ms>                             Default overall upstream timeout (default: 900000)\n" ++
+    "  --connect-timeout=<ms>                     Upstream connect timeout (default: 10000)\n" ++
     "  --insecure                                 Skip upstream TLS certificate verification\n" ++
     "  --upstream-host=<url>                      Single upstream origin (catch-all path rule)\n" ++
     "  --access-control-allow-origin=<origin>     Default CORS origin (default: \"*\")\n" ++
@@ -57,6 +58,7 @@ pub fn main(init: std.process.Init) !void {
     var port_override: ?u16 = null;
     var bind_override: ?[]const u8 = null;
     var timeout_override: ?usize = null;
+    var connect_timeout_override: ?usize = null;
     var insecure_override = false;
     var upstream_host_override: ?[]const u8 = null;
     var origin_override: ?[]const u8 = null;
@@ -76,6 +78,8 @@ pub fn main(init: std.process.Init) !void {
             bind_override = if (value.len > 0) value else null;
         } else if (std.mem.startsWith(u8, arg, "--timeout=")) {
             timeout_override = std.fmt.parseInt(usize, valueAfter(arg), 10) catch return MainError.InvalidTimeout;
+        } else if (std.mem.startsWith(u8, arg, "--connect-timeout=")) {
+            connect_timeout_override = std.fmt.parseInt(usize, valueAfter(arg), 10) catch return MainError.InvalidTimeout;
         } else if (std.mem.startsWith(u8, arg, "--upstream-host=")) {
             upstream_host_override = valueAfter(arg);
         } else if (std.mem.startsWith(u8, arg, "--access-control-allow-origin=")) {
@@ -108,6 +112,7 @@ pub fn main(init: std.process.Init) !void {
     if (port_override) |p| config.port = p;
     if (bind_override) |b| config.bind_address = b;
     if (timeout_override) |t| config.timeout_ms = t;
+    if (connect_timeout_override) |t| config.connect_timeout_ms = t;
     if (insecure_override) config.insecure = true;
     if (upstream_host_override) |h| {
         config.setUpstreamHost(h) catch |err| {
@@ -130,12 +135,13 @@ pub fn main(init: std.process.Init) !void {
         log.info("verbose logging enabled", .{});
         log.info("bind {s}", .{ if (config.bind_address) |b| b else "0.0.0.0 (default)" });
         log.info("interface {s}", .{ if (config.interface) |i| i else "(default)" });
-        log.info("default timeout {d}ms", .{ config.timeout_ms });
+        log.info("default overall timeout {d}ms", .{ config.timeout_ms });
+        log.info("default connect timeout {d}ms", .{ config.connect_timeout_ms });
         log.info("insecure {s}", .{ if (config.insecure) "enabled" else "disabled" });
         log.info("default origin override {s}", .{ if (config.default_origin) |o| o else "* (fallback)" });
         log.info("verbose upstream {s}", .{ if (config.verbose_upstream) "enabled" else "disabled" });
         for (config.upstream) |u| {
-            log.info("  upstream {s} (timeout {d}ms, insecure {s}, {d} path rule(s))", .{ u.host, u.effectiveTimeoutMs(config.timeout_ms), if (u.effectiveInsecure(config.insecure)) "enabled" else "disabled", u.path.len });
+            log.info("  upstream {s} (overall timeout {d}ms, connect timeout {d}ms, insecure {s}, {d} path rule(s))", .{ u.host, u.effectiveTimeoutMs(config.timeout_ms), u.effectiveConnectTimeoutMs(config.connect_timeout_ms), if (u.effectiveInsecure(config.insecure)) "enabled" else "disabled", u.path.len });
         }
     }
 

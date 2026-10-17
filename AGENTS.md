@@ -9,10 +9,15 @@ The dependencies (`httpx` 0.2.2 and `zig-curl`) both declare
 - It pins to a 0.17 toolchain (set `ZIG_17` to override, e.g. `/snap/zig/17037/zig`).
 - Both deps are **local path dependencies** in `build.zig.zon`:
   `curl -> ../zig-curl` and `httpx -> ../httpx.zig`. They must exist as siblings
-  of this checkout (CI checks both out as siblings). Do not switch `httpx` back
-  to a URL dep: GitHub tarballs extract to a nested `httpx.zig-X/` wrapper that
-  Zig 0.17's build graph hashes incorrectly (`N-V-__...` content hash), so the
-  pinned hash never matches.
+  of this checkout. If a sibling is missing, the `./zig` wrapper clones it from
+  GitHub at the pinned commit before building (override the pin via the
+  `ZIG_CURL_REF`/`HTTPX_REF` env vars). A sibling that has a `build.zig.zon` is
+  treated as present and left alone, so a local pin/edit survives; CI still
+  checks both out as siblings, so the bootstrap is a no-op there.
+- Do not switch `httpx` back to a URL dep: GitHub tarballs extract to a nested
+  `httpx.zig-X/` wrapper that Zig 0.17's build graph hashes incorrectly
+  (`N-V-__...` content hash), so the pinned hash never matches. The bootstrap
+  uses `git clone` (not a tarball) precisely to avoid that wrapper.
 
 ## Zig 0.17 language/toolchain quirks in this codebase
 

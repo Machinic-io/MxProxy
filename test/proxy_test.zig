@@ -23,7 +23,8 @@ test "config: defaults" {
     try std.testing.expectEqual(@as(u16, 8080), cfg.port);
     try std.testing.expect(cfg.bind_address == null);
     try std.testing.expect(cfg.interface == null);
-    try std.testing.expectEqual(@as(usize, 10000), cfg.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 900000), cfg.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 10000), cfg.connect_timeout_ms);
     try std.testing.expectEqual(@as(usize, 0), cfg.upstream.len);
 }
 
@@ -47,7 +48,7 @@ test "config: decode full config from json string" {
 
     const json = "{\"port\": 9090, \"interface\": \"lo\", \"upstream\": [" ++
         "{\"host\": \"https://example.com\", \"interface\": \"eth0\", " ++
-        "\"timeout_ms\": 1234, \"insecure\": true, " ++
+        "\"timeout_ms\": 4321, \"connect_timeout_ms\": 1234, \"insecure\": true, " ++
         "\"request_headers\": {\"Origin\": null, \"X-Forwarded-For\": \"1.2.3.4\"}, " ++
         "\"response_headers\": {\"Server\": null}, " ++
         "\"path\": [{\"type\": \"plain\", \"local\": \"/example/\", \"remote\": \"/\"}, " ++
@@ -63,9 +64,12 @@ test "config: decode full config from json string" {
     const u = cfg.upstream[0];
     try std.testing.expectEqualStrings("https://example.com", u.host);
     try std.testing.expectEqualStrings("eth0", u.interface.?);
-    try std.testing.expectEqual(@as(usize, 1234), u.timeout_ms.?);
-    // effective timeout: per-upstream wins over the default
-    try std.testing.expectEqual(@as(usize, 1234), u.effectiveTimeoutMs(10000));
+    try std.testing.expectEqual(@as(usize, 4321), u.timeout_ms.?);
+    // effective overall timeout: per-upstream wins over the default
+    try std.testing.expectEqual(@as(usize, 4321), u.effectiveTimeoutMs(900000));
+    try std.testing.expectEqual(@as(usize, 1234), u.connect_timeout_ms.?);
+    // effective connect timeout: per-upstream wins over the default
+    try std.testing.expectEqual(@as(usize, 1234), u.effectiveConnectTimeoutMs(10000));
     try std.testing.expect(u.insecure.?);
     // effective insecure: per-upstream wins over the default
     try std.testing.expect(u.effectiveInsecure(false));
@@ -101,6 +105,30 @@ test "config: decode full config from json string" {
     try std.testing.expectEqualStrings("/base/", u.path[1].remote);
 }
 
+test "config: path mapping type defaults to plain when missing" {
+    const allocator = std.testing.allocator;
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+
+    // A path rule with no `type` key decodes to the "plain" default, so
+    // Config.load's validation passes; an explicit type is honored as-is.
+    const json = "{\"upstream\": [{\"host\": \"https://example.com\", \"path\": [{\"local\": \"/a/\", \"remote\": \"/b/\"}, {\"type\": \"plain\", \"local\": \"/c/\"}]}]}";
+
+    var cfg = try Config.load(io_ctx.io, allocator, null, json);
+    defer cfg.deinit();
+
+    const u = cfg.upstream[0];
+    try std.testing.expectEqual(@as(usize, 2), u.path.len);
+    // missing type defaults to "plain"
+    try std.testing.expectEqualStrings("plain", u.path[0].@"type");
+    try std.testing.expectEqualStrings("/a/", u.path[0].local);
+    try std.testing.expectEqualStrings("/b/", u.path[0].remote);
+    // explicit type is honored, and missing remote defaults to ""
+    try std.testing.expectEqualStrings("plain", u.path[1].@"type");
+    try std.testing.expectEqualStrings("/c/", u.path[1].local);
+    try std.testing.expectEqualStrings("", u.path[1].remote);
+}
+
 test "config: upstream interface fallback to default" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
@@ -120,31 +148,96 @@ test "config: upstream interface fallback to default" {
     try std.testing.expect(cfg.upstream[1].effectiveInterface(null) == null);
 }
 
-test "config: timeout default + effective fallback" {
+test "config: connect timeout default + effective fallback" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
 
-    // No top-level timeout: default is 10s, a per-upstream timeout_ms still wins.
+    // No top-level connect timeout: default is 10s, a per-upstream
+    // connect_timeout_ms still wins.
     const json_default = "{\"upstream\": [" ++
-        "{\"host\": \"https://a.example.com\", \"timeout_ms\": 4321}, " ++
+        "{\"host\": \"https://a.example.com\", \"connect_timeout_ms\": 4321}, " ++
         "{\"host\": \"https://b.example.com\"}]}";
     var cfg1 = try Config.load(io_ctx.io, allocator, null, json_default);
     defer cfg1.deinit();
-    try std.testing.expectEqual(@as(usize, 10000), cfg1.timeout_ms);
-    try std.testing.expectEqual(@as(usize, 4321), cfg1.upstream[0].effectiveTimeoutMs(cfg1.timeout_ms));
-    try std.testing.expectEqual(@as(usize, 10000), cfg1.upstream[1].effectiveTimeoutMs(cfg1.timeout_ms));
+    try std.testing.expectEqual(@as(usize, 10000), cfg1.connect_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 4321), cfg1.upstream[0].effectiveConnectTimeoutMs(cfg1.connect_timeout_ms));
+    try std.testing.expectEqual(@as(usize, 10000), cfg1.upstream[1].effectiveConnectTimeoutMs(cfg1.connect_timeout_ms));
+
+    // A top-level connect_timeout_ms overrides the built-in default for upstreams
+    // that do not set their own.
+    const json_custom = "{\"connect_timeout_ms\": 20000, \"upstream\": [" ++
+        "{\"host\": \"https://a.example.com\"}, " ++
+        "{\"host\": \"https://b.example.com\", \"connect_timeout_ms\": 777}]}";
+    var cfg2 = try Config.load(io_ctx.io, allocator, null, json_custom);
+    defer cfg2.deinit();
+    try std.testing.expectEqual(@as(usize, 20000), cfg2.connect_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 20000), cfg2.upstream[0].effectiveConnectTimeoutMs(cfg2.connect_timeout_ms));
+    try std.testing.expectEqual(@as(usize, 777), cfg2.upstream[1].effectiveConnectTimeoutMs(cfg2.connect_timeout_ms));
+}
+
+test "config: overall timeout default + effective fallback" {
+    const allocator = std.testing.allocator;
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+
+    // No top-level overall timeout: default is 900000ms, a per-upstream
+    // timeout_ms still wins.
+    const json_default = "{\"upstream\": [" ++
+        "{\"host\": \"https://a.example.com\", \"timeout_ms\": 43210}, " ++
+        "{\"host\": \"https://b.example.com\"}]}";
+    var cfg1 = try Config.load(io_ctx.io, allocator, null, json_default);
+    defer cfg1.deinit();
+    try std.testing.expectEqual(@as(usize, 900000), cfg1.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 43210), cfg1.upstream[0].effectiveTimeoutMs(cfg1.timeout_ms));
+    try std.testing.expectEqual(@as(usize, 900000), cfg1.upstream[1].effectiveTimeoutMs(cfg1.timeout_ms));
 
     // A top-level timeout_ms overrides the built-in default for upstreams that
     // do not set their own.
     const json_custom = "{\"timeout_ms\": 20000, \"upstream\": [" ++
         "{\"host\": \"https://a.example.com\"}, " ++
-        "{\"host\": \"https://b.example.com\", \"timeout_ms\": 777}]}";
+        "{\"host\": \"https://b.example.com\", \"timeout_ms\": 77700}]}";
     var cfg2 = try Config.load(io_ctx.io, allocator, null, json_custom);
     defer cfg2.deinit();
     try std.testing.expectEqual(@as(usize, 20000), cfg2.timeout_ms);
     try std.testing.expectEqual(@as(usize, 20000), cfg2.upstream[0].effectiveTimeoutMs(cfg2.timeout_ms));
-    try std.testing.expectEqual(@as(usize, 777), cfg2.upstream[1].effectiveTimeoutMs(cfg2.timeout_ms));
+    try std.testing.expectEqual(@as(usize, 77700), cfg2.upstream[1].effectiveTimeoutMs(cfg2.timeout_ms));
+}
+
+test "config: timeout validation accepts connect < overall" {
+    const allocator = std.testing.allocator;
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+
+    // Defaults are valid (overall 900000 > connect 10000).
+    var cfg0 = try Config.load(io_ctx.io, allocator, null, "{\"upstream\": [{\"host\": \"https://a.example.com\"}]}");
+    defer cfg0.deinit();
+    try std.testing.expect(cfg0.upstream[0].effectiveTimeoutMs(cfg0.timeout_ms) > cfg0.upstream[0].effectiveConnectTimeoutMs(cfg0.connect_timeout_ms));
+
+    // Per-upstream overrides keep the effective connect below the overall.
+    const json = "{\"timeout_ms\": 10000, \"connect_timeout_ms\": 1000, \"upstream\": [" ++
+        "{\"host\": \"https://a.example.com\", \"connect_timeout_ms\": 2000}, " ++
+        "{\"host\": \"https://b.example.com\", \"timeout_ms\": 30000, \"connect_timeout_ms\": 5000}]}";
+    var cfg = try Config.load(io_ctx.io, allocator, null, json);
+    defer cfg.deinit();
+    for (cfg.upstream) |u| {
+        try std.testing.expect(u.effectiveTimeoutMs(cfg.timeout_ms) > u.effectiveConnectTimeoutMs(cfg.connect_timeout_ms));
+    }
+}
+
+test "forward: classifyTimeout heuristic" {
+    const connect = @as(u64, 10000);
+    const overall = @as(u64, 900000);
+
+    // A connect timeout ends at ~connect_ms, far below the midpoint (~455000ms).
+    try std.testing.expectEqual(@as(forward_mod.TimeoutKind, .connect), forward_mod.classifyTimeout(10000, connect, overall));
+    try std.testing.expectEqual(@as(forward_mod.TimeoutKind, .connect), forward_mod.classifyTimeout(11000, connect, overall));
+    // An overall timeout ends at ~overall_ms, above the midpoint.
+    try std.testing.expectEqual(@as(forward_mod.TimeoutKind, .overall), forward_mod.classifyTimeout(900000, connect, overall));
+    try std.testing.expectEqual(@as(forward_mod.TimeoutKind, .overall), forward_mod.classifyTimeout(899000, connect, overall));
+    // The boundary is the midpoint: (10000 + 900000) / 2 = 455000ms.
+    try std.testing.expectEqual(@as(forward_mod.TimeoutKind, .connect), forward_mod.classifyTimeout(455000, connect, overall));
+    try std.testing.expectEqual(@as(forward_mod.TimeoutKind, .overall), forward_mod.classifyTimeout(455001, connect, overall));
 }
 
 test "config: insecure default + effective fallback" {
@@ -259,6 +352,21 @@ test "config: validation errors" {
     try std.testing.expectError(
         config_mod.ConfigError.InvalidProtocol,
         Config.load(io_ctx.io, allocator, null, "{\"upstream\": [{\"host\": \"https://x.com\", \"protocol\": \"http3\"}]}"),
+    );
+    // top-level overall timeout less than the connect timeout
+    try std.testing.expectError(
+        config_mod.ConfigError.ConnectTimeoutNotLessThanOverall,
+        Config.load(io_ctx.io, allocator, null, "{\"timeout_ms\": 1000, \"connect_timeout_ms\": 2000, \"upstream\": [{\"host\": \"https://x.com\"}]}"),
+    );
+    // top-level overall timeout equal to the connect timeout
+    try std.testing.expectError(
+        config_mod.ConfigError.ConnectTimeoutNotLessThanOverall,
+        Config.load(io_ctx.io, allocator, null, "{\"timeout_ms\": 5000, \"connect_timeout_ms\": 5000, \"upstream\": [{\"host\": \"https://x.com\"}]}"),
+    );
+    // per-upstream connect override that exceeds the effective overall timeout
+    try std.testing.expectError(
+        config_mod.ConfigError.ConnectTimeoutNotLessThanOverall,
+        Config.load(io_ctx.io, allocator, null, "{\"timeout_ms\": 10000, \"connect_timeout_ms\": 1000, \"upstream\": [{\"host\": \"https://x.com\", \"connect_timeout_ms\": 20000}]}"),
     );
 }
 
@@ -1136,6 +1244,82 @@ test "integration: relay a chunked body (chunked in -> chunked out)" {
 }
 
 // ---------------------------------------------------------------------------
+// Overall-timeout integration test: an upstream that accepts the connection
+// but never responds. The proxy's overall (transfer) timeout is set to a small
+// value, so the transfer trips it and the proxy 502s — instead of waiting the
+// 15-minute default (which would hang the test).
+// ---------------------------------------------------------------------------
+
+/// Upstream handler that accepts the connection and holds it open for
+/// `hold_ns` without ever responding, so the proxy's transfer runs until it
+/// trips the overall (transfer) timeout. Uses a wall-clock deadline + yield
+/// (0.17 has no std.Thread.sleep), the same pattern the concurrency barrier
+/// uses. `hold_ns` is set above the overall timeout so the connection is still
+/// open (but unresponsive) when the proxy gives up.
+fn serveUpstreamSilent(socket: tcp.Socket, hold_ns: i64) void {
+    defer socket.close();
+    const deadline = std.Io.Timestamp.now(socket.io, .awake);
+    while (deadline.durationTo(std.Io.Timestamp.now(socket.io, .awake)).nanoseconds < hold_ns) {
+        std.Thread.yield() catch {};
+    }
+}
+
+fn serveUpstreamSilentOnce(listener: *tcp.Listener, io: std.Io, hold_ns: i64) void {
+    const socket = listener.accept(io) catch return;
+    serveUpstreamSilent(socket, hold_ns);
+}
+
+test "integration: small overall timeout is hit (502, no hang)" {
+    const allocator = std.heap.page_allocator;
+    var io_ctx = try httpx.IoContext.init(std.testing.allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io;
+
+    // Upstream accepts but never responds, holding the connection open for
+    // 2500ms — longer than the 2000ms overall timeout below.
+    var upstream = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
+    defer upstream.close(io);
+    const upstream_port = upstream.localPort();
+
+    const upstream_host = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{upstream_port});
+    defer allocator.free(upstream_host);
+    // Small overall (transfer) timeout + an even smaller connect timeout, so
+    // the local connect succeeds but the never-arriving response trips the
+    // overall budget (the connect budget does not fire first).
+    const cfg_json = try std.fmt.allocPrint(allocator, "{{\"timeout_ms\":2000,\"connect_timeout_ms\":500,\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
+    defer allocator.free(cfg_json);
+    var cfg = try Config.load(io, allocator, null, cfg_json);
+    defer cfg.deinit();
+    var forwarder = try forward_mod.Forwarder.init(cfg, false);
+
+    var proxy = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
+    defer proxy.close(io);
+    const proxy_port = proxy.localPort();
+
+    const hold_ns: i64 = 2500 * 1_000_000; // 2500ms
+    const up_thread = try std.Thread.spawn(.{}, serveUpstreamSilentOnce, .{ &upstream, io, hold_ns });
+    const proxy_thread = try std.Thread.spawn(.{}, proxyOnce, .{ &proxy, io, allocator, &forwarder });
+
+    var client = tcp.connect(io, "127.0.0.1", proxy_port) catch return IntError.ConnectFailed;
+    defer client.close();
+    client.writeAll("GET /slow HTTP/1.1\r\nHost: local\r\n\r\n") catch return IntError.RelayFailed;
+    var resp = std.array_list.Managed(u8).init(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = client.read(&chunk) catch break;
+        if (n == 0) break;
+        try resp.appendSlice(chunk[0..n]);
+    }
+
+    up_thread.join();
+    proxy_thread.join();
+
+    const body = try resp.toOwnedSlice();
+    // The proxy 502s once the overall timeout trips (the upstream never replied).
+    try std.testing.expect(std.mem.indexOf(u8, body, "HTTP/1.1 502") != null);
+}
+
+// ---------------------------------------------------------------------------
 // Concurrency test: submit N parallel requests and verify the proxy handles
 // them all at once. The proxy is driven the same way production runs it
 // (thread-per-connection in an accept loop, like server.zig). A barrier in the
@@ -1143,37 +1327,41 @@ test "integration: relay a chunked body (chunked in -> chunked out)" {
 // timing-based assertion, so the test is not flaky.
 // ---------------------------------------------------------------------------
 
-const N_CONCURRENT: usize = 10;
-/// 0.17 removed std.time timestamps, so the barrier's give-up deadline is a
-/// yield count rather than a wall-clock timeout. Each wait iteration yields the
-/// CPU (std.Thread.yield), so a handler waiting at the barrier never starves the
-/// other handler threads that still have to reach it. This matters on a small,
-/// contended runner (CI): a tight spin there hogs a core and the N-1 stragglers
-/// never make progress in time, so a healthy concurrent proxy gets misreported
-/// as not reaching the barrier. The budget bounds how long a NON-concurrent
-/// proxy keeps a handler waiting before the test fails instead of hanging; it
-/// must comfortably exceed the stagger between the N handler threads arriving,
-/// or a healthy proxy can be misreported as serial.
-const BARRIER_MAX_YIELDS: u32 = 10_000_000;
+const N_CONCURRENT: usize = 5;
+/// The barrier's give-up deadline, as a wall-clock interval read from the
+/// socket's Io clock (0.17 removed std.time timestamps, so std.Io.Timestamp is
+/// used). Each wait iteration yields the CPU (std.Thread.yield), so a handler
+/// waiting at the barrier never starves the other handler threads that still
+/// have to reach it. This matters on a small, contended runner (CI): a tight
+/// spin there hogs a core and the N-1 stragglers never make progress in time,
+/// so a healthy concurrent proxy gets misreported as not reaching the barrier.
+/// The deadline bounds how long a NON-concurrent proxy keeps a handler waiting
+/// before the test fails instead of hanging; it must comfortably exceed the
+/// stagger between the N handler threads arriving, or a healthy proxy can be
+/// misreported as serial. A yield count (the previous bound) was too coarse: on
+/// a contended runner 10M yields elapse in well under a second, before the
+/// stragglers arrive, so the barrier was misreported as unreached. A wall-clock
+/// deadline is runner-independent. It stays below the overall timeout (60000ms)
+/// so a slow-but-concurrent barrier still 200s rather than 502s.
+const BARRIER_TIMEOUT_NS: i64 = 20 * 1_000_000_000; // 20s
 var in_flight: usize = 0;
 var barrier_reached: bool = true;
 
 /// Upstream handler with a concurrency barrier: read the request, count
 /// ourselves in flight, and (cooperatively) wait until all N_CONCURRENT are in
 /// flight at once (proving the proxy handled them concurrently). If the proxy is
-/// not concurrent the barrier is never reached; after BARRIER_MAX_YIELDS we mark
+/// not concurrent the barrier is never reached; after BARRIER_TIMEOUT_NS we mark
 /// it unreached so the test fails instead of hanging.
 fn serveUpstreamBarrier(socket: tcp.Socket, allocator: std.mem.Allocator) void {
     const cl = readUpstreamRequest(socket);
     _ = @atomicRmw(usize, &in_flight, .Add, 1, .monotonic);
-    var yields: u32 = 0;
+    const deadline = std.Io.Timestamp.now(socket.io, .awake);
     while (@atomicLoad(usize, &in_flight, .monotonic) < N_CONCURRENT) {
-        if (yields >= BARRIER_MAX_YIELDS) {
+        if (deadline.durationTo(std.Io.Timestamp.now(socket.io, .awake)).nanoseconds >= BARRIER_TIMEOUT_NS) {
             @atomicStore(bool, &barrier_reached, false, .monotonic);
             break;
         }
         std.Thread.yield() catch {};
-        yields += 1;
     }
     // The handler always runs to completion (readUpstreamRequest /
     // respondUpstream swallow their errors), so decrement + close on the
@@ -1232,9 +1420,10 @@ test "integration: N concurrent requests are all in flight at once" {
     defer allocator.free(upstream_host);
     // The upstream handlers hold their connection at the barrier until all N
     // requests are in flight, so the proxy's libcurl transfers wait that long
-    // for a response. Give the transfer a generous timeout so a contended
-    // runner (slow barrier) can't trip the default 10s timeout and 502 the
-    // requests before the barrier is reached.
+    // for a response. Give the overall (transfer) timeout a value comfortably
+    // above the 20s barrier so a contended runner (slow barrier) can't trip it
+    // and 502 the requests before the barrier is reached, while still bounding
+    // the test's worst-case runtime well below the 15min default.
     const cfg_json = try std.fmt.allocPrint(allocator, "{{\"timeout_ms\":60000,\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
     defer allocator.free(cfg_json);
     var cfg = try Config.load(io, allocator, null, cfg_json);

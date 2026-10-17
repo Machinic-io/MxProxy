@@ -9,6 +9,24 @@ const headers_mod = @import("headers");
 
 const log = std.log.scoped(.forward);
 
+/// Which timeout budget a failed upstream transfer tripped. libcurl reports
+/// both a connect timeout and an overall timeout as CURLE_OPERATION_TIMEDOUT,
+/// so the kind is inferred from the elapsed total time (see classifyTimeout).
+pub const TimeoutKind = enum {
+    /// The TCP/TLS connect phase exceeded the connect timeout.
+    connect,
+    /// The whole transfer exceeded the overall timeout.
+    overall,
+};
+
+/// Classify which timeout budget a CURLE_OPERATION_TIMEDOUT transfer tripped,
+/// from the elapsed total time. A connect timeout ends at ~connect_ms and an
+/// overall timeout at ~overall_ms; overall > connect (enforced by config
+/// validation), so the midpoint between the two budgets separates the cases.
+pub fn classifyTimeout(elapsed_ms: u64, connect_ms: u64, overall_ms: u64) TimeoutKind {
+    return if (elapsed_ms <= (connect_ms + overall_ms) / 2) .connect else .overall;
+}
+
 const Self = @This();
 
 config: *const config_mod.Config,
@@ -152,6 +170,11 @@ const Ctx = struct {
     /// owned and needs no freeing. Lets the request error be logged with the
     /// actual upstream failure reason.
     curl_error: ?[]const u8 = null,
+    /// Which timeout budget the last failed transfer tripped (heuristic; see
+    /// classifyTimeout). `null` when the last failure was not a timeout.
+    timeout_kind: ?TimeoutKind = null,
+    /// Elapsed total transfer time in ms when a timeout fired (see timeout_kind).
+    timeout_elapsed_ms: ?u64 = null,
 
     fn deinit(self: *Ctx) void {
         if (self.tail.len > 0) self.allocator.free(self.tail);
@@ -332,9 +355,17 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
             }
             if (err == error.Curl) {
                 // Report the upstream failure with the libcurl reason so the log
-                // says which upstream failed and why (e.g. "Timeout was reached").
-                const detail = ctx.curl_error orelse "unknown libcurl error";
-                log.err("upstream error: {s} {s} -> {s} ({s})", .{ method, path, url, detail });
+                // says which upstream failed and why. A timeout is tagged with
+                // which budget tripped (connect vs overall; see classifyTimeout).
+                if (ctx.timeout_kind) |kind| {
+                    const tag = switch (kind) {
+                        .connect => "connect timeout",
+                        .overall => "overall timeout",
+                    };
+                    log.warn("upstream error: {s} {s} -> {s} ({s} after {d}ms)", .{ method, path, url, tag, ctx.timeout_elapsed_ms.? });
+                } else {
+                    log.err("upstream error: {s} {s} -> {s} ({s})", .{ method, path, url, ctx.curl_error orelse "unknown libcurl error" });
+                }
             }
             if (!ctx.head_done) try writeError(socket, allocator, 502);
             return err;
@@ -373,6 +404,7 @@ fn attempt(
     if (self.config.verbose_upstream) {
         try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_VERBOSE, @as(c_long, 1)), &diag);
     }
+    try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_CONNECTTIMEOUT_MS, upstream.effectiveConnectTimeoutMs(self.config.connect_timeout_ms)), &diag);
     try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_TIMEOUT_MS, upstream.effectiveTimeoutMs(self.config.timeout_ms)), &diag);
     const user_agent = [_]u8{ 'M', 'x', 'P', 'r', 'o', 'x', 'y', 0 };
     try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_USERAGENT, &user_agent[0]), &diag);
@@ -414,6 +446,22 @@ fn attempt(
     curl.checkCode(curl.libcurl.curl_easy_perform(curl_handle), &diag) catch |err| {
         // Remember the libcurl reason so forward() can log an actionable error.
         ctx.curl_error = diag.getMessage();
+        // libcurl reports both a connect timeout and an overall timeout as
+        // CURLE_OPERATION_TIMEDOUT; infer which one fired from the elapsed total
+        // time (a connect timeout ends at ~connect_ms, an overall one at the
+        // larger ~timeout_ms budget).
+        const timeout_code: curl.libcurl.CURLcode = @intCast(curl.libcurl.CURLE_OPERATION_TIMEDOUT);
+        const is_timeout = if (diag.error_code) |ec| switch (ec) {
+            .code => |code| code == timeout_code,
+            else => false,
+        } else false;
+        if (is_timeout) {
+            var total_time: f64 = 0; // seconds
+            _ = curl.libcurl.curl_easy_getinfo(curl_handle, curl.libcurl.CURLINFO_TOTAL_TIME, &total_time);
+            const elapsed_ms = @as(u64, @intFromFloat(total_time * 1000.0));
+            ctx.timeout_kind = classifyTimeout(elapsed_ms, upstream.effectiveConnectTimeoutMs(self.config.connect_timeout_ms), upstream.effectiveTimeoutMs(self.config.timeout_ms));
+            ctx.timeout_elapsed_ms = elapsed_ms;
+        }
         return err;
     };
 }
@@ -432,6 +480,8 @@ fn resetForRetry(ctx: *Ctx) void {
     ctx.head_done = false;
     ctx.response_status = 0;
     ctx.curl_error = null;
+    ctx.timeout_kind = null;
+    ctx.timeout_elapsed_ms = null;
     ctx.head_buf.clearRetainingCapacity();
     ctx.tail_pos = 0;
 }

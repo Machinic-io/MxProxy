@@ -113,7 +113,8 @@ Or from a config file:
 | `--config=<path>` | Path to a JSON config file. |
 | `--config-json=<json>` | Inline JSON config (top-level keys only). |
 | `--port=<u16>` | Listen port (default `8080`). |
-| `--timeout=<ms>` | Default upstream request timeout in milliseconds (default `10000`). A per-upstream `timeout_ms` still overrides it. |
+| `--timeout=<ms>` | Default overall upstream timeout in milliseconds (default `900000`). A per-upstream `timeout_ms` still overrides it. |
+| `--connect-timeout=<ms>` | Upstream connect timeout in milliseconds (default `10000`). A per-upstream `connect_timeout_ms` still overrides it. |
 | `--insecure` | Skip TLS certificate verification for all upstreams. A per-upstream `insecure` still overrides it. |
 | `--upstream-host=<scheme://authority>` | Use a single catch-all upstream. Conflicts if the config already defines upstreams. |
 | `--access-control-allow-origin=<value>` | Default CORS origin swapped into responses (otherwise `*`). |
@@ -129,13 +130,15 @@ All fields are optional; omitted fields fall back to their defaults.
 {
   "port": 8080,
   "interface": "eth0",
-  "timeout_ms": 10000,
+  "timeout_ms": 900000,
+  "connect_timeout_ms": 10000,
   "insecure": false,
   "upstream": [
     {
       "host": "https://api.example.com",
       "interface": "eth1",
       "timeout_ms": 5000,
+      "connect_timeout_ms": 3000,
       "insecure": false,
       "protocol": "auto",
       "request_headers": {
@@ -161,7 +164,8 @@ All fields are optional; omitted fields fall back to their defaults.
 | --- | --- | --- | --- |
 | `port` | number | `8080` | Port to listen on. |
 | `interface` | string | _(none)_ | Default upstream-facing network interface. |
-| `timeout_ms` | number | `10000` | Default upstream request timeout in milliseconds. |
+| `timeout_ms` | number | `900000` | Default overall upstream timeout in milliseconds. |
+| `connect_timeout_ms` | number | `10000` | Default upstream connect timeout in milliseconds. |
 | `insecure` | bool | `false` | Default for skipping TLS certificate verification (see `--insecure`). |
 | `upstream` | array | `[]` | Upstream servers, in match order. |
 
@@ -171,12 +175,18 @@ All fields are optional; omitted fields fall back to their defaults.
 | --- | --- | --- | --- |
 | `host` | string | — | Upstream origin URL: `scheme://authority` (e.g. `https://api.example.com`). **Required.** |
 | `interface` | string | inherit | Network interface for this upstream. Falls back to the top-level `interface`. |
-| `timeout_ms` | number | inherit | Upstream request timeout in milliseconds. Falls back to the top-level `timeout_ms` (default `10000`). |
+| `timeout_ms` | number | inherit | Overall upstream timeout in milliseconds. Falls back to the top-level `timeout_ms` (default `900000`). |
+| `connect_timeout_ms` | number | inherit | Upstream connect timeout in milliseconds. Falls back to the top-level `connect_timeout_ms` (default `10000`). |
 | `insecure` | bool | inherit | Skip TLS certificate verification. Falls back to the top-level `insecure` (default `false`). |
 | `protocol` | string | `"auto"` | `"http1"`, `"http2"`, or `"auto"`. |
 | `request_headers` | object | `{}` | Header overrides applied to requests sent upstream. |
 | `response_headers` | object | `{}` | Header overrides applied to responses sent to the client. |
 | `path` | array | `[]` | Path rewrite rules, first match wins. An empty list makes the upstream a catch-all. |
+
+The overall timeout must be greater than the connect timeout (checked at startup
+for the effective values, `ConnectTimeoutNotLessThanOverall`): libcurl caps the
+connect phase by the connect timeout and the whole transfer by the overall
+timeout, so `overall <= connect` is meaningless.
 
 #### Path rules
 
@@ -186,7 +196,7 @@ Each rule rewrites the client path before forwarding:
 { "type": "plain", "local": "/api/", "remote": "/v1/" }
 ```
 
-- `type` is `"plain"` (a strict prefix match) — the only supported type today.
+- `type` is `"plain"` (a strict prefix match) — the only supported type today. It defaults to `"plain"` when omitted.
 - `local` is the client-facing prefix to strip. `""` or `"/"` matches any path.
 - `remote` is the upstream prefix to splice in. `""` or `"/"` maps to the upstream root.
 - The first matching rule wins (upstream order, then rule order). If no rule matches, the first upstream with no `path` rules forwards the path unchanged.
