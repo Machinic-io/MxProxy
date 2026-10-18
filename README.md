@@ -11,10 +11,11 @@ A fast, lightweight HTTP **reverse proxy** written in [Zig](https://ziglang.org)
 - **Multi-upstream routing** — prefix or regex path rewriting with first-match-wins, plus a catch-all passthrough for rule-less upstreams.
 - **Header control** — set or delete headers in either direction (requests to the upstream, responses to the client).
 - **CORS out of the box** — swap `Access-Control-Allow-Origin` for a configured value (per-upstream override → CLI default → `*`), and rewrite `Origin` so the upstream sees a same-origin request.
-- **HTTP/1.1 + HTTP/2** — per-upstream protocol selection with an `auto` mode that negotiates HTTP/2 over TLS and transparently falls back to HTTP/1.1 when it is safe to do so.
+- **HTTP/1.1 + HTTP/2 upstreams** — per-upstream protocol selection with an `auto` mode that negotiates HTTP/2 over TLS and transparently falls back to HTTP/1.1 when it is safe to do so. The client-facing side is HTTP/1.1 only.
 - **Transparent compression** — `Accept-Encoding`/`Content-Encoding` are relayed verbatim (never decoded), so the upstream can compress for the real client.
 - **Streaming bodies** — `Content-Length` and chunked request bodies are relayed, and response bodies stream straight from libcurl to the client. The proxy answers `Expect: 100-continue` itself (it sends `100 Continue` before pulling the body) and does not relay the header upstream.
 - **TLS** — HTTPS upstreams, with an opt-in `insecure` mode that skips certificate verification.
+- **Interface binding** — upstream traffic can be forced out through a specific network interface (e.g. `eth0`) via libcurl's `CURLOPT_INTERFACE`; a per-upstream `interface` falls back to the top-level default.
 - **Mature upstream engine** — upstream transfers are driven directly against the system libcurl.
 
 ## How it works
@@ -72,6 +73,16 @@ The pipeline is split across a few focused modules:
 | `src/forward.zig` | Proxy core: parse request, drive libcurl |
 | `src/server.zig` | Accept loop, thread-per-connection, graceful shutdown |
 
+## Why libcurl
+
+Upstream transfers are driven directly against [libcurl](https://curl.se/), the de facto standard C library for URL transfers. A proxy's upstream client is exactly where protocol edge cases hide, and libcurl is one of the most battle-tested HTTP clients in existence.
+
+- **Protocol coverage without the work** — HTTP/1.1, HTTP/2 over TLS (ALPN negotiation), and the transparent HTTP/1.1 fallback behind `auto` mode all come from libcurl. A fully conformant HTTP/2 + TLS client in pure Zig would be a large project and a large attack surface; the Zig stdlib has no client with this coverage.
+- **Streaming fits the design** — libcurl's callback model (read/header/write) maps one-to-one onto MxProxy's relay: the request body is supplied on demand, the response head is relayed as soon as it arrives, and the body streams straight through to the client without buffering.
+- **System library, not vendored** — the build links against the system libcurl (see [Requirements](#requirements)), so there is no large C dependency tree in the repo; updates and security fixes are handled by the OS/distro.
+- **Thin, auditable Zig bindings** — the [zig-curl](https://github.com/jiacai2050/zig-curl) bindings keep the interface small: `src/forward.zig` drives `curl_easy_*` directly with three callbacks.
+- **Features for free** — the connect and overall timeout budgets (`connect_timeout_ms`/`timeout_ms`) and TLS with opt-in skip-verification (`insecure`) map straight onto libcurl options.
+
 ## Requirements
 
 - **Zig 0.17** — the project pins its toolchain (see [Building](#building)).
@@ -79,6 +90,7 @@ The pipeline is split across a few focused modules:
 - **Local dependency checkouts** as siblings of this repo (referenced by `build.zig.zon`):
   - [`zig-curl`](https://github.com/jiacai2050/zig-curl) → `../zig-curl` (libcurl C bindings)
   - [`httpx`](https://github.com/muhammad-fiaz/httpx.zig) → `../httpx.zig` (HTTP/1.1 parser/writer + TCP sockets)
+  - [`zig-regex`](https://github.com/zig-utils/zig-regex) → `../zig-regex` (regex path-rewrite rules)
 
 ## Building
 
@@ -221,7 +233,6 @@ Each rule rewrites the client path before forwarding:
 ```
 
 - The first matching rule wins (upstream order, then rule order). If no rule matches, the first upstream with no `path` rules forwards the path unchanged; if there is none, the request 404s.
-- Client framing violations are the client's fault, not the upstream's: a malformed request head, an incomplete or malformed body, or a premature client close is answered with `400` (an oversized head with `431`), while upstream failures are `502`.
 
 #### Header overrides
 
@@ -238,7 +249,47 @@ Two headers get special treatment:
 
 ### `auto` protocol mode
 
-With `"protocol": "auto"`, MxProxy tries HTTP/2 over TLS first. If the upstream transfer fails **before any bytes reach the client** and the request body is re-sendable, it transparently retries over HTTP/1.1. (A streaming request body that is consumed on the first attempt disables this fallback.)
+With `"protocol": "auto"`, MxProxy tries HTTP/2 over TLS first. If the upstream transfer fails **before any bytes reach the client** and the request body is re-sendable, it transparently retries over HTTP/1.1 — the client sees a single response, but the failed first attempt is logged at info level. (A streaming request body that is consumed on the first attempt disables this fallback.)
+
+### Error attribution
+
+When a request fails, MxProxy attributes the fault to the party responsible and answers (and logs) accordingly: client faults get a `4xx`, upstream failures get a `502`, proxy-internal faults get a `500`.
+
+- **Malformed request head → `400`** — a bad request line or header is rejected before anything is forwarded. An oversized head (larger than 64 KiB, or more headers than the parser allows) gets `431` instead. Contradictory body framing — e.g. both `Content-Length` and `Transfer-Encoding` (a request-smuggling vector) — and bad `Content-Length` values are also rejected with `400`.
+- **Incomplete or malformed body → `400`** — the client sends fewer bytes than the declared `Content-Length`, or its chunked body is malformed or EOF arrives before the terminating chunk. The transfer is aborted immediately, so a truncated body is never forwarded to the upstream.
+- **Premature client close → `400`** — the client disconnects while its body is still being read, or mid-response while the proxy writes back. The failed transfer is attributed to the client, not the upstream; the proxy answers `400` when the upstream's response head has not been relayed yet (once it is in flight, nothing more can be said).
+- **Upstream failure → `502`** — the upstream is unreachable, the TLS handshake fails, or the transfer times out. The log carries the libcurl reason and which budget tripped (`connect timeout` vs `overall timeout`).
+- **Proxy fault → `500`** — e.g. out of memory building the request, before the upstream transfer starts.
+
+The same attribution applies to the logs: a client fault prints `client error` at info level, an upstream failure prints `upstream error` (info level for routine timeouts, error level otherwise), so a flaky client cannot masquerade as an upstream outage in monitoring.
+
+### Debugging upstream headers
+
+`--verbose` logs MxProxy's own decisions (the computed upstream URL, the per-request summary). To see what actually crosses the wire, use `--verbose-upstream`: it enables libcurl's verbose diagnostics, which print every upstream transaction to stderr — the full request and response headers as exchanged with the upstream, plus connection and protocol state (TCP connect, TLS/ALPN negotiation for HTTPS upstreams). Body bytes are not included.
+
+Against a local test upstream:
+
+```
+./zig build run -- --port=8080 --upstream-host=http://127.0.0.1:8081 --verbose-upstream
+
+*   Trying 127.0.0.1:8081...
+* Connected to 127.0.0.1 (127.0.0.1) port 8081
+> GET / HTTP/1.1
+Host: 127.0.0.1:8081
+User-Agent: MxProxy
+Accept: */*
+
+< HTTP/1.0 200 OK
+< Server: SimpleHTTP/0.6 Python/3.12.3
+< Content-Type: text/html; charset=utf-8
+< Content-Length: 8112
+```
+
+- `>` — the request line and headers MxProxy sends upstream: the final form after path rewrite, hop-by-hop stripping, header overrides, and the `Origin`/CORS swaps have been applied. The `Host` header is the upstream's origin, not the client's.
+- `<` — the raw response headers from the upstream, before the proxy strips hop-by-hop headers or applies response overrides.
+- `*` — connection and protocol details; the version on the `>` line shows what `auto` mode settled on (`HTTP/2` when HTTP/2 over TLS was negotiated).
+
+This is the ground truth for what the upstream actually received and returned: use it to verify header overrides and the `Origin` swap took effect, to check the rewritten path, and to diagnose HTTP/2-vs-HTTP/1.1 selection in `auto` mode.
 
 ## Testing
 

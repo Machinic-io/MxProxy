@@ -287,7 +287,7 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
             // The head is larger than the fixed read buffer. Reject it rather
             // than reading an empty buffer and misreporting it as a close.
             try writeError(socket, allocator, 431);
-            if (self.verbose) log.info("[proxy] request head too large (>64 KiB) -> 431", .{});
+            log.info("[proxy] request head too large (>64 KiB) -> 431", .{});
             return;
         }
         const n = socket.read(head_buf[total..]) catch return error.ClientClosed;
@@ -322,7 +322,7 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
     // 2. Route to an upstream (path rewrite).
     var route = try self.router.resolve(allocator, path) orelse {
         try writeError(socket, allocator, 404);
-        if (self.verbose) log.info("[proxy] {s:<7} {s} -> 404 ({d}us)", .{ method, path, elapsedUs(start, socket.io) });
+        log.info("[proxy] {s:<7} {s} -> 404 ({d}us)", .{ method, path, elapsedUs(start, socket.io) });
         return;
     };
     defer route.deinit();
@@ -435,8 +435,19 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
         else
             firstProtocol(upstream.protocol);
         self.attempt(allocator, &ctx, url_z, upstream, req_headers, method_z, http_version) catch |err| {
-            if (can_fallback and !ctx.head_done and !use_fallback) {
-                // Nothing reached the client; retry the same request over HTTP/1.1.
+            if (can_fallback and !ctx.head_done and !use_fallback and ctx.client_fault == null) {
+                // Nothing reached the client; retry the same request over
+                // HTTP/1.1. Log the failed attempt first: resetForRetry clears
+                // the libcurl reason, so it would otherwise be swallowed.
+                if (ctx.timeout_kind) |kind| {
+                    const tag = switch (kind) {
+                        .connect => "connect timeout",
+                        .overall => "overall timeout",
+                    };
+                    log.info("upstream error: {s} {s} -> {s} ({s} after {d}ms; retrying over HTTP/1.1)", .{ method, path, url, tag, ctx.timeout_elapsed_ms.? });
+                } else {
+                    log.info("upstream error: {s} {s} -> {s} ({s}; retrying over HTTP/1.1)", .{ method, path, url, ctx.curl_error orelse "unknown libcurl error" });
+                }
                 resetForRetry(&ctx);
                 use_fallback = true;
                 continue;
@@ -693,7 +704,12 @@ fn headerCallback(buffer: ?*anyopaque, size: usize, nmemb: usize, user_data: ?*a
             if (http2_head) |s| ctx.allocator.free(s);
             ctx.allocator.free(resp_head);
         }
-        ctx.socket.writeAll(resp_head) catch return 0;
+        ctx.socket.writeAll(resp_head) catch {
+            // The client went away while the response head was being relayed:
+            // same attribution as a mid-body close (see writeCallback).
+            ctx.client_fault = ClientFault.ClientClosed;
+            return 0;
+        };
         ctx.head_done = true;
     }
     return n;
