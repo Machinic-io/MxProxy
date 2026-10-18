@@ -9,7 +9,7 @@ const httpx = @import("httpx");
 const tcp = httpx.tcp;
 const parser = httpx.http1.parser;
 
-// NOTE: the pinned Zig 0.16 toolchain does not accept backtick multiline string
+// NOTE: the pinned Zig 0.17 toolchain does not accept backtick multiline string
 // literals, so all JSON fixtures here use regular double-quoted strings.
 
 test "config: defaults" {
@@ -98,7 +98,7 @@ test "config: decode full config from json string" {
 
     // path mappings
     try std.testing.expectEqual(@as(usize, 2), u.path.len);
-    try std.testing.expectEqualStrings("plain", u.path[0].@"type");
+    try std.testing.expectEqualStrings("plain", u.path[0].type);
     try std.testing.expectEqualStrings("/example/", u.path[0].local);
     try std.testing.expectEqualStrings("/", u.path[0].remote);
     try std.testing.expectEqualStrings("/other/", u.path[1].local);
@@ -120,11 +120,11 @@ test "config: path mapping type defaults to plain when missing" {
     const u = cfg.upstream[0];
     try std.testing.expectEqual(@as(usize, 2), u.path.len);
     // missing type defaults to "plain"
-    try std.testing.expectEqualStrings("plain", u.path[0].@"type");
+    try std.testing.expectEqualStrings("plain", u.path[0].type);
     try std.testing.expectEqualStrings("/a/", u.path[0].local);
     try std.testing.expectEqualStrings("/b/", u.path[0].remote);
     // explicit type is honored, and missing remote defaults to ""
-    try std.testing.expectEqualStrings("plain", u.path[1].@"type");
+    try std.testing.expectEqualStrings("plain", u.path[1].type);
     try std.testing.expectEqualStrings("/c/", u.path[1].local);
     try std.testing.expectEqualStrings("", u.path[1].remote);
 }
@@ -406,7 +406,7 @@ test "config: setUpstreamHost" {
     try std.testing.expectEqual(@as(usize, 1), cfg.upstream.len);
     try std.testing.expectEqualStrings("http://localhost:9931", cfg.upstream[0].host);
     try std.testing.expectEqual(@as(usize, 1), cfg.upstream[0].path.len);
-    try std.testing.expectEqualStrings("plain", cfg.upstream[0].path[0].@"type");
+    try std.testing.expectEqualStrings("plain", cfg.upstream[0].path[0].type);
     try std.testing.expectEqualStrings("", cfg.upstream[0].path[0].local);
     try std.testing.expectEqualStrings("", cfg.upstream[0].path[0].remote);
 }
@@ -475,8 +475,7 @@ test "router: first match wins across upstreams" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [" ++
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [" ++
         "{\"host\": \"https://first.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/x/\", \"remote\": \"/1/\"}]}, " ++
         "{\"host\": \"https://second.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/x/\", \"remote\": \"/2/\"}]}]}");
     defer cfg.deinit();
@@ -492,8 +491,7 @@ test "router: catch-all passthrough when no rule matches" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [" ++
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [" ++
         "{\"host\": \"https://specific.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/api/\", \"remote\": \"/\"}]}, " ++
         "{\"host\": \"https://default.com\"}]}");
     defer cfg.deinit();
@@ -510,8 +508,7 @@ test "router: no match and no catch-all returns null" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://s.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/api/\", \"remote\": \"/\"}]}]}");
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://s.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/api/\", \"remote\": \"/\"}]}]}");
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
@@ -522,8 +519,7 @@ test "router: root prefix matches everything" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://s.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/\", \"remote\": \"/base/\"}]}]}");
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://s.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/\", \"remote\": \"/base/\"}]}]}");
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
@@ -536,8 +532,7 @@ test "router: first rule wins within a single upstream" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [" ++
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [" ++
         "{\"type\": \"plain\", \"local\": \"/a/\", \"remote\": \"/1/\"}, " ++
         "{\"type\": \"plain\", \"local\": \"/a/b/\", \"remote\": \"/2/\"}]}]}");
     defer cfg.deinit();
@@ -553,8 +548,7 @@ test "router: later rule matches when earlier does not" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [" ++
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [" ++
         "{\"type\": \"plain\", \"local\": \"/a/\", \"remote\": \"/1/\"}, " ++
         "{\"type\": \"plain\", \"local\": \"/b/\", \"remote\": \"/2/\"}]}]}");
     defer cfg.deinit();
@@ -569,8 +563,7 @@ test "router: prefix match is literal, not segment-aware" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/api/\", \"remote\": \"/\"}]}]}");
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/api/\", \"remote\": \"/\"}]}]}");
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
@@ -584,8 +577,7 @@ test "router: matching exactly the prefix yields empty rest" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/api/\", \"remote\": \"/base/\"}]}]}");
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/api/\", \"remote\": \"/base/\"}]}]}");
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
@@ -598,8 +590,7 @@ test "router: a rule match beats the catch-all" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [" ++
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [" ++
         "{\"host\": \"https://default.com\"}, " ++
         "{\"host\": \"https://specific.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/x/\", \"remote\": \"/\"}]}]}");
     defer cfg.deinit();
@@ -621,8 +612,7 @@ test "router: catch-all picks the first rule-less upstream" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [" ++
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [" ++
         "{\"host\": \"https://d1.com\"}, " ++
         "{\"host\": \"https://d2.com\"}, " ++
         "{\"host\": \"https://s.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/z/\", \"remote\": \"/\"}]}]}");
@@ -642,8 +632,7 @@ test "router: plain and regex rules dispatch by type" {
     // wins, and each rule dispatches to its own implementation via the vtable.
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [" ++
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [" ++
         "{\"type\": \"plain\", \"local\": \"/a/\", \"remote\": \"/p/\"}, " ++
         "{\"type\": \"regex\", \"local\": \"/r/([0-9]+)\", \"remote\": \"/p/$1\"}]}]}");
     defer cfg.deinit();
@@ -664,8 +653,7 @@ test "router: blank local matches any path" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"plain\", \"local\": \"\", \"remote\": \"/\"}]}]}");
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"plain\", \"local\": \"\", \"remote\": \"/\"}]}]}");
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
@@ -686,8 +674,7 @@ test "router: local and remote both / pass the source path through unchanged" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/\", \"remote\": \"/\"}]}]}");
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/\", \"remote\": \"/\"}]}]}");
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
@@ -709,8 +696,7 @@ test "router: all-root rule is a direct (identity) mapping" {
     // Both local and remote omitted (blank is the default) -> the direct path:
     // it forwards the client path unchanged and borrows it (the route does not
     // own it, so deinit is a no-op).
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"plain\"}]}]}");
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"plain\"}]}]}");
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
@@ -729,8 +715,7 @@ test "router: root local with a non-root remote rewrites (not direct)" {
     defer io_ctx.deinit();
     // local="" (root) matches any path, but remote is a real prefix, so this is
     // a genuine plain rewrite (prepend), NOT the direct/identity path.
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"plain\", \"local\": \"\", \"remote\": \"/x/\"}]}]}");
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"plain\", \"local\": \"\", \"remote\": \"/x/\"}]}]}");
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
@@ -745,22 +730,22 @@ test "router: root local with a non-root remote rewrites (not direct)" {
 fn resolvedUrl(allocator: Allocator, router: *const router_mod.Router, path: []const u8) ![]u8 {
     var route = try router.resolve(allocator, path) orelse return error.NoRoute;
     defer route.deinit();
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ route.upstream.host, route.remote_path });
+    return allocator.print("{s}{s}", .{ route.upstream.host, route.remote_path });
 }
 
 test "router: wildcard local passes the source path through under the host" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://www.printables.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/\", \"remote\": \"\"}]}]}");
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://www.printables.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/\", \"remote\": \"\"}]}]}");
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
     const url = try resolvedUrl(allocator, &router, "/model/1801944-factorio-assembling-machine/files");
     defer allocator.free(url);
     try std.testing.expectEqualStrings(
-        "https://www.printables.com/model/1801944-factorio-assembling-machine/files", url,
+        "https://www.printables.com/model/1801944-factorio-assembling-machine/files",
+        url,
     );
 }
 
@@ -768,15 +753,15 @@ test "router: local /printables strips the prefix to the host root" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://www.printables.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/printables\", \"remote\": \"\"}]}]}");
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://www.printables.com\", \"path\": [{\"type\": \"plain\", \"local\": \"/printables\", \"remote\": \"\"}]}]}");
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
     const url = try resolvedUrl(allocator, &router, "/printables/model/1801944-factorio-assembling-machine/files");
     defer allocator.free(url);
     try std.testing.expectEqualStrings(
-        "https://www.printables.com/model/1801944-factorio-assembling-machine/files", url,
+        "https://www.printables.com/model/1801944-factorio-assembling-machine/files",
+        url,
     );
 }
 
@@ -784,8 +769,7 @@ test "router: root remote never doubles the leading slash" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://www.printables.com\", \"path\": [{\"type\": \"plain\", \"local\": \"\", \"remote\": \"/\"}]}]}");
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://www.printables.com\", \"path\": [{\"type\": \"plain\", \"local\": \"\", \"remote\": \"/\"}]}]}");
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
@@ -804,7 +788,7 @@ test "config: regex path rule compiles and decodes" {
     defer cfg.deinit();
 
     const p = cfg.upstream[0].path[0];
-    try std.testing.expectEqualStrings("regex", p.@"type");
+    try std.testing.expectEqualStrings("regex", p.type);
     try std.testing.expectEqualStrings("/api/product/([0-9]+)/info", p.local);
     try std.testing.expectEqualStrings("/api/product/info/$1", p.remote);
 }
@@ -813,8 +797,7 @@ test "router: regex rewrites with a capture group" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"regex\", \"local\": \"/api/product/([0-9]+)/info\", \"remote\": \"/api/product/info/$1\"}]}]}");
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"regex\", \"local\": \"/api/product/([0-9]+)/info\", \"remote\": \"/api/product/info/$1\"}]}]}");
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
@@ -828,8 +811,7 @@ test "router: regex requires a full match (partial is a non-match)" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"regex\", \"local\": \"/api/product/([0-9]+)/info\", \"remote\": \"/api/product/info/$1\"}]}]}");
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"regex\", \"local\": \"/api/product/([0-9]+)/info\", \"remote\": \"/api/product/info/$1\"}]}]}");
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
@@ -843,8 +825,7 @@ test "router: regex with multiple groups" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"regex\", \"local\": \"/a/([0-9]+)-([0-9]+)/b\", \"remote\": \"/x/$1/$2\"}]}]}");
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"regex\", \"local\": \"/a/([0-9]+)-([0-9]+)/b\", \"remote\": \"/x/$1/$2\"}]}]}");
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
@@ -857,8 +838,7 @@ test "router: regex $0 substitutes the whole match" {
     const allocator = std.testing.allocator;
     var io_ctx = try httpx.IoContext.init(allocator);
     defer io_ctx.deinit();
-    var cfg = try loadConfig(allocator, &io_ctx,
-        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"regex\", \"local\": \"([0-9]+)\", \"remote\": \"/num/$0\"}]}]}");
+    var cfg = try loadConfig(allocator, &io_ctx, "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"regex\", \"local\": \"([0-9]+)\", \"remote\": \"/num/$0\"}]}]}");
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
@@ -1087,9 +1067,9 @@ fn readUpstreamRequest(socket: tcp.Socket) usize {
 /// Send the upstream's canned 200 reply: a marker header plus a body that echoes
 /// the received content-length (so the client can verify the body was relayed).
 fn respondUpstream(socket: tcp.Socket, allocator: std.mem.Allocator, cl: usize) void {
-    const body = std.fmt.allocPrint(allocator, "bodylen={d}\n", .{ cl }) catch return;
+    const body = allocator.print("bodylen={d}\n", .{cl}) catch return;
     defer allocator.free(body);
-    const resp = std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Marker: up\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch return;
+    const resp = allocator.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Marker: up\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch return;
     defer allocator.free(resp);
     socket.writeAll(resp) catch return;
 }
@@ -1130,13 +1110,13 @@ fn relayRequest(io: std.Io, allocator: std.mem.Allocator, request: []const u8) !
     const upstream_port = upstream.localPort();
 
     // Forwarder configured to route everything to that upstream.
-    const upstream_host = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{ upstream_port });
+    const upstream_host = try allocator.print("http://127.0.0.1:{d}", .{upstream_port});
     defer allocator.free(upstream_host);
-    const cfg_json = try std.fmt.allocPrint(allocator, "{{\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{ upstream_host });
+    const cfg_json = try allocator.print("{{\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
     defer allocator.free(cfg_json);
     var cfg = try Config.load(io, allocator, null, cfg_json);
     defer cfg.deinit();
-    var forwarder = try forward_mod.Forwarder.init(cfg, false);
+    var forwarder = try forward_mod.Forwarder.init(cfg, false, false);
 
     // Proxy on an ephemeral port.
     var proxy = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
@@ -1205,7 +1185,7 @@ fn buildChunkedBody(allocator: std.mem.Allocator, chunks: []const []const u8) ![
     var buf = std.array_list.Managed(u8).init(allocator);
     errdefer buf.deinit();
     for (chunks) |c| {
-        const hex = std.fmt.allocPrint(allocator, "{x}", .{ c.len }) catch return error.OutOfMemory;
+        const hex = allocator.print("{x}", .{c.len}) catch return error.OutOfMemory;
         defer allocator.free(hex);
         try buf.appendSlice(hex);
         try buf.appendSlice("\r\n");
@@ -1279,9 +1259,9 @@ fn serveUpstreamChunked(socket: tcp.Socket, allocator: std.mem.Allocator) void {
 
     const framing = if (is_chunked) "chunked" else "other";
     const ok_val: u32 = if (ok) 1 else 0;
-    const body = std.fmt.allocPrint(allocator, "framing={s} bodylen={d} ok={d}\n", .{ framing, decoded_total, ok_val }) catch return;
+    const body = allocator.print("framing={s} bodylen={d} ok={d}\n", .{ framing, decoded_total, ok_val }) catch return;
     defer allocator.free(body);
-    const resp = std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Marker: up\r\nX-Framing: {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ framing, body.len, body }) catch return;
+    const resp = allocator.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Marker: up\r\nX-Framing: {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ framing, body.len, body }) catch return;
     defer allocator.free(resp);
     socket.writeAll(resp) catch return;
 }
@@ -1298,13 +1278,13 @@ fn relayChunkedRequest(io: std.Io, allocator: std.mem.Allocator, request: []cons
     defer upstream.close(io);
     const upstream_port = upstream.localPort();
 
-    const upstream_host = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{ upstream_port });
+    const upstream_host = try allocator.print("http://127.0.0.1:{d}", .{upstream_port});
     defer allocator.free(upstream_host);
-    const cfg_json = try std.fmt.allocPrint(allocator, "{{\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{ upstream_host });
+    const cfg_json = try allocator.print("{{\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
     defer allocator.free(cfg_json);
     var cfg = try Config.load(io, allocator, null, cfg_json);
     defer cfg.deinit();
-    var forwarder = try forward_mod.Forwarder.init(cfg, false);
+    var forwarder = try forward_mod.Forwarder.init(cfg, false, false);
 
     var proxy = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
     defer proxy.close(io);
@@ -1341,9 +1321,9 @@ test "integration: relay a chunked body (chunked in -> chunked out)" {
     defer allocator.free(payload);
     for (payload, 0..) |*b, i| b.* = @as(u8, @intCast(i % 251));
     const chunked_body = try buildChunkedBody(allocator, &.{
-        payload[0..100 * 1024],
+        payload[0 .. 100 * 1024],
         payload[100 * 1024 .. 250 * 1024],
-        payload[250 * 1024..],
+        payload[250 * 1024 ..],
     });
     defer allocator.free(chunked_body);
 
@@ -1398,16 +1378,16 @@ test "integration: small overall timeout is hit (502, no hang)" {
     defer upstream.close(io);
     const upstream_port = upstream.localPort();
 
-    const upstream_host = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{upstream_port});
+    const upstream_host = try allocator.print("http://127.0.0.1:{d}", .{upstream_port});
     defer allocator.free(upstream_host);
     // Small overall (transfer) timeout + an even smaller connect timeout, so
     // the local connect succeeds but the never-arriving response trips the
     // overall budget (the connect budget does not fire first).
-    const cfg_json = try std.fmt.allocPrint(allocator, "{{\"timeout_ms\":2000,\"connect_timeout_ms\":500,\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
+    const cfg_json = try allocator.print("{{\"timeout_ms\":2000,\"connect_timeout_ms\":500,\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
     defer allocator.free(cfg_json);
     var cfg = try Config.load(io, allocator, null, cfg_json);
     defer cfg.deinit();
-    var forwarder = try forward_mod.Forwarder.init(cfg, false);
+    var forwarder = try forward_mod.Forwarder.init(cfg, false, false);
 
     var proxy = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
     defer proxy.close(io);
@@ -1533,7 +1513,7 @@ test "integration: N concurrent requests are all in flight at once" {
     var upstream = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
     defer upstream.close(io);
     const upstream_port = upstream.localPort();
-    const upstream_host = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{upstream_port});
+    const upstream_host = try allocator.print("http://127.0.0.1:{d}", .{upstream_port});
     defer allocator.free(upstream_host);
     // The upstream handlers hold their connection at the barrier until all N
     // requests are in flight, so the proxy's libcurl transfers wait that long
@@ -1541,11 +1521,11 @@ test "integration: N concurrent requests are all in flight at once" {
     // above the 20s barrier so a contended runner (slow barrier) can't trip it
     // and 502 the requests before the barrier is reached, while still bounding
     // the test's worst-case runtime well below the 15min default.
-    const cfg_json = try std.fmt.allocPrint(allocator, "{{\"timeout_ms\":60000,\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
+    const cfg_json = try allocator.print("{{\"timeout_ms\":60000,\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
     defer allocator.free(cfg_json);
     var cfg = try Config.load(io, allocator, null, cfg_json);
     defer cfg.deinit();
-    var forwarder = try forward_mod.Forwarder.init(cfg, false);
+    var forwarder = try forward_mod.Forwarder.init(cfg, false, false);
 
     var proxy = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
     defer proxy.close(io);
@@ -1563,7 +1543,7 @@ test "integration: N concurrent requests are all in flight at once" {
     var i: usize = 0;
     while (i < n) : (i += 1) {
         clients[i] = tcp.connect(io, "127.0.0.1", proxy_port) catch return IntError.ConnectFailed;
-        const req = try std.fmt.allocPrint(allocator, "GET /req{d} HTTP/1.1\r\nHost: local\r\n\r\n", .{i});
+        const req = try allocator.print("GET /req{d} HTTP/1.1\r\nHost: local\r\n\r\n", .{i});
         clients[i].writeAll(req) catch {
             allocator.free(req);
             return IntError.RelayFailed;
@@ -1594,4 +1574,245 @@ test "integration: N concurrent requests are all in flight at once" {
 
     // The barrier proves all n requests were in flight simultaneously.
     try std.testing.expect(@atomicLoad(bool, &barrier_reached, .monotonic));
+}
+
+// ---------------------------------------------------------------------------
+// Client-fault and interim-response tests: malformed heads and short bodies
+// are 400 (the client's fault), 1xx interims are skipped, and
+// Expect: 100-continue is answered by the proxy itself.
+// ---------------------------------------------------------------------------
+
+/// Upstream that sends a 100 Continue interim block, then the final 200.
+fn serveUpstreamInterimOnce(listener: *tcp.Listener, io: std.Io, allocator: std.mem.Allocator) void {
+    const socket = listener.accept(io) catch return;
+    defer socket.close();
+    _ = readUpstreamRequest(socket);
+    const body = "ok\n";
+    const final = allocator.print("HTTP/1.1 200 OK\r\nX-Marker: up\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch return;
+    defer allocator.free(final);
+    socket.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch return;
+    socket.writeAll(final) catch return;
+}
+
+/// The Forwarder configured against one upstream (the caller deinit()s cfg).
+const Relay = struct {
+    cfg: *Config,
+    forwarder: forward_mod.Forwarder,
+};
+
+/// Load a config that routes everything to the given upstream port and build
+/// the Forwarder for it.
+fn relaySetup(io: std.Io, allocator: std.mem.Allocator, upstream_port: u16) !Relay {
+    const upstream_host = try allocator.print("http://127.0.0.1:{d}", .{upstream_port});
+    defer allocator.free(upstream_host);
+    const cfg_json = try allocator.print("{{\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
+    defer allocator.free(cfg_json);
+    const cfg = try Config.load(io, allocator, null, cfg_json);
+    const forwarder = try forward_mod.Forwarder.init(cfg, false, false);
+    return .{ .cfg = cfg, .forwarder = forwarder };
+}
+
+test "integration: malformed request head is a 400" {
+    const allocator = std.heap.page_allocator;
+    var io_ctx = try httpx.IoContext.init(std.testing.allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io;
+
+    var upstream = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
+    defer upstream.close(io);
+    var relay = try relaySetup(io, allocator, upstream.localPort());
+    defer relay.cfg.deinit();
+
+    var proxy = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
+    defer proxy.close(io);
+    const proxy_port = proxy.localPort();
+    const proxy_thread = try std.Thread.spawn(.{}, proxyOnce, .{ &proxy, io, allocator, &relay.forwarder });
+
+    var client = tcp.connect(io, "127.0.0.1", proxy_port) catch return IntError.ConnectFailed;
+    defer client.close();
+    // Not a request line at all: the head fails to parse -> 400, not a silent
+    // close.
+    client.writeAll("GARBAGE\r\n\r\n") catch return IntError.RelayFailed;
+    var resp = std.array_list.Managed(u8).init(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = client.read(&chunk) catch break;
+        if (n == 0) break;
+        try resp.appendSlice(chunk[0..n]);
+    }
+    proxy_thread.join();
+    const body = try resp.toOwnedSlice();
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "HTTP/1.1 400") != null);
+}
+
+test "integration: short Content-Length body is a 400" {
+    const allocator = std.heap.page_allocator;
+    var io_ctx = try httpx.IoContext.init(std.testing.allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io;
+
+    var upstream = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
+    defer upstream.close(io);
+    var relay = try relaySetup(io, allocator, upstream.localPort());
+    defer relay.cfg.deinit();
+
+    var proxy = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
+    defer proxy.close(io);
+    const proxy_port = proxy.localPort();
+    const proxy_thread = try std.Thread.spawn(.{}, proxyOnce, .{ &proxy, io, allocator, &relay.forwarder });
+
+    var client = tcp.connect(io, "127.0.0.1", proxy_port) catch return IntError.ConnectFailed;
+    defer client.close();
+    // Declare 10 body bytes, send only 5, then half-close the write side so
+    // the proxy sees EOF before the declared length arrives.
+    client.writeAll("POST /short HTTP/1.1\r\nHost: local\r\nContent-Length: 10\r\n\r\nabc") catch return IntError.RelayFailed;
+    client.shutdownWrite();
+    var resp = std.array_list.Managed(u8).init(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = client.read(&chunk) catch break;
+        if (n == 0) break;
+        try resp.appendSlice(chunk[0..n]);
+    }
+    proxy_thread.join();
+    const body = try resp.toOwnedSlice();
+    defer allocator.free(body);
+    // The upload is the client's fault: 400, and no 502.
+    try std.testing.expect(std.mem.indexOf(u8, body, "HTTP/1.1 400") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "HTTP/1.1 502") == null);
+}
+
+test "integration: 1xx interim is skipped and the final head is relayed" {
+    const allocator = std.heap.page_allocator;
+    var io_ctx = try httpx.IoContext.init(std.testing.allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io;
+
+    var upstream = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
+    defer upstream.close(io);
+    var relay = try relaySetup(io, allocator, upstream.localPort());
+    defer relay.cfg.deinit();
+
+    var proxy = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
+    defer proxy.close(io);
+    const proxy_port = proxy.localPort();
+    const up_thread = try std.Thread.spawn(.{}, serveUpstreamInterimOnce, .{ &upstream, io, allocator });
+    const proxy_thread = try std.Thread.spawn(.{}, proxyOnce, .{ &proxy, io, allocator, &relay.forwarder });
+
+    var client = tcp.connect(io, "127.0.0.1", proxy_port) catch return IntError.ConnectFailed;
+    defer client.close();
+    client.writeAll("GET /interim HTTP/1.1\r\nHost: local\r\n\r\n") catch return IntError.RelayFailed;
+    var resp = std.array_list.Managed(u8).init(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = client.read(&chunk) catch break;
+        if (n == 0) break;
+        try resp.appendSlice(chunk[0..n]);
+    }
+    up_thread.join();
+    proxy_thread.join();
+    const body = try resp.toOwnedSlice();
+    defer allocator.free(body);
+    // The final 200 (and its body) must reach the client, and the 100 interim
+    // must NOT be relayed as if it were the final head.
+    try std.testing.expect(std.mem.indexOf(u8, body, "HTTP/1.1 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "X-Marker: up") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "ok\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "100 Continue") == null);
+}
+
+test "integration: Expect 100-continue is answered with 100 before the body" {
+    const allocator = std.heap.page_allocator;
+    var io_ctx = try httpx.IoContext.init(std.testing.allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io;
+
+    var upstream = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
+    defer upstream.close(io);
+    var relay = try relaySetup(io, allocator, upstream.localPort());
+    defer relay.cfg.deinit();
+
+    var proxy = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
+    defer proxy.close(io);
+    const proxy_port = proxy.localPort();
+    const up_thread = try std.Thread.spawn(.{}, upstreamOnce, .{ &upstream, io, allocator });
+    const proxy_thread = try std.Thread.spawn(.{}, proxyOnce, .{ &proxy, io, allocator, &relay.forwarder });
+
+    var client = tcp.connect(io, "127.0.0.1", proxy_port) catch return IntError.ConnectFailed;
+    defer client.close();
+    // Send the head (with Expect) but hold back the body: the proxy must grant
+    // the 100 before the body is sent.
+    client.writeAll("POST /e HTTP/1.1\r\nHost: local\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n") catch return IntError.RelayFailed;
+    var resp = std.array_list.Managed(u8).init(allocator);
+    var chunk: [4096]u8 = undefined;
+    // Read until the proxy's 100 arrives (or EOF).
+    var got_100 = false;
+    while (!got_100) {
+        const n = client.read(&chunk) catch break;
+        if (n == 0) break;
+        try resp.appendSlice(chunk[0..n]);
+        got_100 = std.mem.indexOf(u8, resp.items, "HTTP/1.1 100") != null;
+    }
+    // Now send the body and drain the final response.
+    client.writeAll("hello") catch return IntError.RelayFailed;
+    while (true) {
+        const n = client.read(&chunk) catch break;
+        if (n == 0) break;
+        try resp.appendSlice(chunk[0..n]);
+    }
+    up_thread.join();
+    proxy_thread.join();
+    const body = try resp.toOwnedSlice();
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "HTTP/1.1 100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "HTTP/1.1 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "bodylen=5") != null);
+}
+
+test "headers: Host/User-Agent are overridable, framing headers are not" {
+    const allocator = std.testing.allocator;
+    const fields = [_]httpx.http1.parser.Field{
+        .{ .name = "Host", .value = "local:8080" },
+        .{ .name = "User-Agent", .value = "client/1.0" },
+        .{ .name = "Expect", .value = "100-continue" },
+        .{ .name = "Connection", .value = "keep-alive" },
+        .{ .name = "Accept", .value = "text/html" },
+    };
+    var overrides: std.StringArrayHashMapUnmanaged(?[]const u8) = .empty;
+    defer overrides.deinit(allocator);
+    try overrides.put(allocator, "Host", "custom.example.com");
+    // null => delete the client's UA (libcurl's default applies upstream)
+    try overrides.put(allocator, "User-Agent", null);
+    // Framing headers cannot be overridden: the drop wins.
+    try overrides.put(allocator, "Connection", "should-not-appear");
+    try overrides.put(allocator, "X-Added", "yes");
+
+    const out = try headers_mod.buildRequestHeaders(allocator, &fields, &overrides, "https://upstream.example.com");
+    defer {
+        for (out) |s| allocator.free(s);
+        allocator.free(out);
+    }
+    try std.testing.expect(headerContains(out, "Host: custom.example.com"));
+    try std.testing.expect(!headerContains(out, "Host: local:8080"));
+    try std.testing.expect(!headerContains(out, "User-Agent: "));
+    try std.testing.expect(!headerContains(out, "Expect: "));
+    try std.testing.expect(!headerContains(out, "Connection: "));
+    try std.testing.expect(headerContains(out, "Accept: "));
+    try std.testing.expect(headerContains(out, "X-Added: yes"));
+
+    // An override may also SET the managed User-Agent when the client's is
+    // relayed.
+    {
+        var ov2: std.StringArrayHashMapUnmanaged(?[]const u8) = .empty;
+        defer ov2.deinit(allocator);
+        try ov2.put(allocator, "User-Agent", "custom-ua");
+        const out2 = try headers_mod.buildRequestHeaders(allocator, &fields, &ov2, "https://upstream.example.com");
+        defer {
+            for (out2) |s| allocator.free(s);
+            allocator.free(out2);
+        }
+        try std.testing.expect(headerContains(out2, "User-Agent: custom-ua"));
+        try std.testing.expect(!headerContains(out2, "User-Agent: client/1.0"));
+    }
 }

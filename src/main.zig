@@ -15,6 +15,27 @@ pub const MainError = error{
     BadArgument,
 };
 
+/// Set from the command line (--silent) before serving starts; request threads
+/// only read it. While true, the log function below drops info/debug messages
+/// so only warning/error-level output is printed.
+var silent: bool = false;
+
+/// Root-level log override (see `std_options`): forwards every message to the
+/// standard default logger, except info/debug messages while `--silent` is on.
+/// 0.17's log levels are a comptime filter, so a runtime switch like --silent
+/// has to live here, in the log function itself.
+fn logFn(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (silent and (level == .info or level == .debug)) return;
+    std.log.defaultLog(level, scope, format, args);
+}
+
+pub const std_options: std.Options = .{ .logFn = logFn };
+
 const USAGE =
     "Usage: mxproxy [OPTIONS]\n" ++
     "\n" ++
@@ -31,6 +52,7 @@ const USAGE =
     "  --interface=<if>                           Default upstream-facing interface\n" ++
     "  --verbose, -v                              Verbose logging\n" ++
     "  --verbose-upstream                         Verbose libcurl upstream logging\n" ++
+    "  --silent                                   Hide info-level log messages\n" ++
     "  --help, -h                                 Show this help\n";
 
 fn valueAfter(arg: []const u8) []const u8 {
@@ -58,8 +80,7 @@ fn configErrorDetail(err: anyerror) ?[]const u8 {
 }
 
 fn logConfigError(err: anyerror) void {
-    if (configErrorDetail(err)) |detail| log.err("config error: {s}", .{detail})
-    else log.err("config error: {any}", .{err});
+    if (configErrorDetail(err)) |detail| log.err("config error: {s}", .{detail}) else log.err("config error: {any}", .{err});
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -118,11 +139,13 @@ pub fn main(init: std.process.Init) !void {
             verbose_upstream = true;
         } else if (std.mem.eql(u8, arg, "--insecure")) {
             insecure_override = true;
+        } else if (std.mem.eql(u8, arg, "--silent")) {
+            silent = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            std.debug.print("{s}", .{ USAGE });
+            std.debug.print("{s}", .{USAGE});
             return;
         } else {
-            log.err("unknown argument: {s}", .{ arg });
+            log.err("unknown argument: {s}", .{arg});
             return MainError.BadArgument;
         }
     }
@@ -148,32 +171,41 @@ pub fn main(init: std.process.Init) !void {
     if (interface_override) |i| config.interface = i;
     if (verbose_upstream) config.verbose_upstream = true;
 
-    // The config (above) and the forwarder (below) are process-lifetime: they
-    // are allocated from `allocator` and never freed (reclaimed at exit), so
-    // in-flight request threads keep valid references. Per-request allocations
-    // also use `allocator` but are freed on every request, so the working set
-    // stays bounded to in-flight requests rather than growing without bound.
+    // The overrides above are applied AFTER Config.load's own validation, so
+    // re-validate the resolved values (e.g. --port=0 must still be rejected,
+    // and --timeout/--connect-timeout can violate the ordering check).
+    config.validate() catch |err| {
+        logConfigError(err);
+        return err;
+    };
+
+    // The config is process-lifetime: it is allocated from `allocator` and
+    // never freed (reclaimed at exit), so in-flight request threads keep valid
+    // references. Per-request allocations also use `allocator` but are freed
+    // on every request, so the working set stays bounded to in-flight requests
+    // rather than growing without bound.
     try curl.globalInit();
+    defer curl.globalDeinit();
 
     if (verbose) {
         log.info("verbose logging enabled", .{});
-        log.info("bind {s}", .{ if (config.bind_address) |b| b else "0.0.0.0 (default)" });
-        log.info("interface {s}", .{ if (config.interface) |i| i else "(default)" });
-        log.info("default overall timeout {d}ms", .{ config.timeout_ms });
-        log.info("default connect timeout {d}ms", .{ config.connect_timeout_ms });
-        log.info("insecure {s}", .{ if (config.insecure) "enabled" else "disabled" });
-        log.info("default origin override {s}", .{ if (config.default_origin) |o| o else "* (fallback)" });
-        log.info("verbose upstream {s}", .{ if (config.verbose_upstream) "enabled" else "disabled" });
+        log.info("bind {s}", .{if (config.bind_address) |b| b else "0.0.0.0 (default)"});
+        log.info("interface {s}", .{if (config.interface) |i| i else "(default)"});
+        log.info("default overall timeout {d}ms", .{config.timeout_ms});
+        log.info("default connect timeout {d}ms", .{config.connect_timeout_ms});
+        log.info("insecure {s}", .{if (config.insecure) "enabled" else "disabled"});
+        log.info("default origin override {s}", .{if (config.default_origin) |o| o else "* (fallback)"});
+        log.info("verbose upstream {s}", .{if (config.verbose_upstream) "enabled" else "disabled"});
         for (config.upstream) |u| {
             log.info("  upstream {s} (overall timeout {d}ms, connect timeout {d}ms, insecure {s}, {d} path rule(s))", .{ u.host, u.effectiveTimeoutMs(config.timeout_ms), u.effectiveConnectTimeoutMs(config.connect_timeout_ms), if (u.effectiveInsecure(config.insecure)) "enabled" else "disabled", u.path.len });
         }
     }
 
-    const forwarder_val = try forward_mod.Forwarder.init(config, verbose);
-    const forwarder: *forward_mod.Forwarder = try allocator.create(forward_mod.Forwarder);
-    forwarder.* = forwarder_val;
+    // Stack-local: main's frame lives for the whole process, so request
+    // threads keep a valid reference until run() returns.
+    var forwarder = try forward_mod.Forwarder.init(config, verbose, silent);
 
-    var server = server_mod.Server.init(forwarder, allocator, io);
+    var server = server_mod.Server.init(&forwarder, allocator, io);
     server.registerSignalHandlers();
     defer server.deregisterSignalHandlers();
 

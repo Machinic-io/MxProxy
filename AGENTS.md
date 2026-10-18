@@ -25,8 +25,13 @@ Confirmed against the 0.17 toolchain. Avoid these (they do not compile):
 
 - **No backtick multiline string literals.** `` `...` `` is rejected. Use regular
   `"..."` strings (concatenate with `++` if needed).
-- **Keyword identifiers use `@"name"`, not `r#name`.** A struct field whose JSON
-  key is `type` is declared `@"type": []const u8` and accessed `p.@"type"`.
+- **Keyword identifiers use `@"name"`, not `r#name` — except for struct
+  fields, where bare `type` is canonical.** A local or function parameter named
+  `type` must be `@"type"` (a local `const type = 1` is a compile error). A
+  struct field whose JSON key is `type` is declared bare — `type: []const u8`
+  — and accessed `p.type`; `zig fmt` rewrites `@"type"` field spellings to bare
+  `type`, so keep fields bare. (`buildPathMapping` illustrates the mix: its
+  parameter is `@"type"`, the `PathMapping`/`RawPathMapping` fields are `type`.)
   `r#type` is a parse error here.
 - **`std.json.fromJson` does not exist.** Use `std.json.parseFromSliceLeaky(T,
   allocator, bytes, .{ .allocate = .alloc_always })` (returns `T`, strings owned

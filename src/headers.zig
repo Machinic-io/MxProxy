@@ -13,11 +13,12 @@ pub const Header = struct {
 pub const OverrideMap = std.StringArrayHashMapUnmanaged(?[]const u8);
 
 /// Connection-specific / framing headers that libcurl manages and that must
-/// not be relayed verbatim in either direction.
+/// not be relayed verbatim in either direction. They are dropped even when a
+/// per-upstream override names them (libcurl must own the framing).
 const hop_by_hop = [_][]const u8{
-    "Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
-    "TE", "Trailer", "Trailers", "Transfer-Encoding", "Upgrade",
-    "Content-Length",
+    "Connection", "Keep-Alive",     "Proxy-Authenticate", "Proxy-Authorization",
+    "TE",         "Trailer",        "Trailers",           "Transfer-Encoding",
+    "Upgrade",    "Content-Length",
 };
 
 pub fn isHopByHop(name: []const u8) bool {
@@ -25,6 +26,22 @@ pub fn isHopByHop(name: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
     }
     return false;
+}
+
+/// Request headers libcurl synthesizes for the upstream transfer. The
+/// client's values are dropped, but — unlike hop-by-hop headers — a
+/// per-upstream override may replace libcurl's default: libcurl honors a
+/// header-list entry for these (it suppresses its own default when one is
+/// supplied).
+fn isManagedRequest(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "Host") or std.ascii.eqlIgnoreCase(name, "User-Agent");
+}
+
+/// Request headers the proxy itself manages and never relays to the upstream,
+/// even via override. Expect is answered by the proxy itself (it sends
+/// `100 Continue` to the client; see forward.zig).
+fn isProxyManaged(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "Expect");
 }
 
 /// A header is forwardable if the http1 writer can serialize it (name/value
@@ -65,9 +82,12 @@ fn allocHeaderLine(allocator: std.mem.Allocator, name: []const u8, value: []cons
 /// Build "Name: Value" lines for CURLOPT_HTTPHEADER from the parsed client
 /// request headers, applying the upstream's request overrides.
 ///
-/// libcurl owns Host, User-Agent and the framing headers, so those are dropped
-/// from the relayed set (an override may still set them). Accept-Encoding is
-/// relayed verbatim so the upstream can compress for the actual client.
+/// Framing (hop-by-hop) headers and Expect are dropped and cannot be
+/// overridden (libcurl and the proxy manage them; the proxy answers
+/// 100-continue itself). Host and User-Agent get libcurl defaults (the URL
+/// host and "MxProxy"); a per-upstream override replaces the default, and a
+/// null override keeps libcurl's default. Accept-Encoding is relayed verbatim
+/// so the upstream can compress for the actual client.
 /// The client's Origin header is swapped for `request_origin` (the upstream's
 /// own origin) so the upstream sees a same-origin request; a per-upstream
 /// override of Origin (in `overrides`) wins if set.
@@ -86,13 +106,26 @@ pub fn buildRequestHeaders(
     }
 
     for (fields) |f| {
-        if (shouldDropRequest(f.name)) continue;
+        // Framing and proxy-managed headers are never relayed, even under an
+        // override.
+        if (isHopByHop(f.name) or isProxyManaged(f.name)) continue;
+        if (isManagedRequest(f.name)) {
+            // libcurl sets a default Host (from the URL) and User-Agent; an
+            // override replaces it, a null override keeps the default.
+            if (overrides.get(f.name)) |v| {
+                if (v) |newval| {
+                    if (!isForwardable(f.name, newval)) continue;
+                    try out.append(try allocHeaderLine(allocator, f.name, newval));
+                }
+            }
+            continue;
+        }
         if (!isForwardable(f.name, f.value)) continue;
         if (overrides.get(f.name)) |v| {
             if (v) |newval| {
+                if (!isForwardable(f.name, newval)) continue;
                 try out.append(try allocHeaderLine(allocator, f.name, newval));
-            }
-            // v == null => delete
+            } // v == null => delete
         } else if (isOrigin(f.name)) {
             // Swap the client's Origin for the upstream's own origin so the
             // upstream sees a same-origin request; a per-upstream override
@@ -108,8 +141,9 @@ pub fn buildRequestHeaders(
         const name = kv.key_ptr.*;
         const v = kv.value_ptr.*;
         if (v == null) continue; // delete-only override, no original header
-        if (shouldDropRequest(name)) continue;
-        if (nameInFields(fields, name)) continue; // already handled above
+        if (isHopByHop(name) or isProxyManaged(name)) continue;
+        if (nameInFields(fields, name) and !isManagedRequest(name)) continue; // handled above
+        if (!isForwardable(name, v.?)) continue;
         try out.append(try allocHeaderLine(allocator, name, v.?));
     }
 
@@ -144,6 +178,7 @@ pub fn buildResponseHead(
         if (!isForwardable(f.name, f.value)) continue;
         if (overrides.get(f.name)) |v| {
             if (v) |newval| {
+                if (!isForwardable(f.name, newval)) continue;
                 try appendLine(&buf, f.name, newval);
             }
             // v == null => delete
@@ -152,7 +187,9 @@ pub fn buildResponseHead(
             // configured value so the caller's browser accepts the response:
             // the per-upstream override already won above if set, otherwise use
             // the --access-control-allow-origin default, else "*".
-            try appendLine(&buf, f.name, default_origin orelse "*");
+            const origin = default_origin orelse "*";
+            if (!isForwardable(f.name, origin)) continue;
+            try appendLine(&buf, f.name, origin);
         } else {
             try appendLine(&buf, f.name, f.value);
         }
@@ -165,6 +202,7 @@ pub fn buildResponseHead(
         if (v == null) continue;
         if (shouldDropResponse(name)) continue;
         if (nameInFields(fields, name)) continue;
+        if (!isForwardable(name, v.?)) continue;
         try appendLine(&buf, name, v.?);
     }
 
@@ -184,16 +222,6 @@ fn appendLine(buf: *std.array_list.Managed(u8), name: []const u8, value: []const
     try buf.append(' ');
     try buf.appendSlice(value);
     try buf.appendSlice("\r\n");
-}
-
-fn shouldDropRequest(name: []const u8) bool {
-    if (isHopByHop(name)) return true;
-    if (std.ascii.eqlIgnoreCase(name, "Host")) return true;
-    if (std.ascii.eqlIgnoreCase(name, "User-Agent")) return true;
-    // Accept-Encoding is relayed so upstream can compress for the actual client.
-    // libcurl is not asked to decode (CURLOPT_ACCEPT_ENCODING unset), so the
-    // compressed body is forwarded verbatim with Content-Encoding intact.
-    return false;
 }
 
 fn shouldDropResponse(name: []const u8) bool {

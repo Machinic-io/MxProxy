@@ -37,7 +37,7 @@ pub const PathMapping = pathmap_mod.PathMapping;
 const RawPathMapping = struct {
     /// Match type, defaulting to `"plain"` when the key is absent from the JSON
     /// so an omitted type is a valid plain rule.
-    @"type": []const u8 = "plain",
+    type: []const u8 = "plain",
     /// The client-facing pattern. Defaults to blank ("") when absent, which
     /// matches any path (the direct/identity case when `remote` is also root).
     local: []const u8 = "",
@@ -307,7 +307,7 @@ pub const Config = struct {
         const list = try allocator.alloc(PathMapping, raw.len);
         errdefer allocator.free(list);
         for (raw, list) |r, *u| {
-            u.* = pathmap_mod.buildPathMapping(allocator, r.@"type", r.local, r.remote) catch |err| switch (err) {
+            u.* = pathmap_mod.buildPathMapping(allocator, r.type, r.local, r.remote) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 pathmap_mod.Error.InvalidPathType => return ConfigError.InvalidPathType,
                 pathmap_mod.Error.InvalidRegex => return ConfigError.InvalidRegex,

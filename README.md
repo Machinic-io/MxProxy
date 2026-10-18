@@ -13,7 +13,7 @@ A fast, lightweight HTTP **reverse proxy** written in [Zig](https://ziglang.org)
 - **CORS out of the box** — swap `Access-Control-Allow-Origin` for a configured value (per-upstream override → CLI default → `*`), and rewrite `Origin` so the upstream sees a same-origin request.
 - **HTTP/1.1 + HTTP/2** — per-upstream protocol selection with an `auto` mode that negotiates HTTP/2 over TLS and transparently falls back to HTTP/1.1 when it is safe to do so.
 - **Transparent compression** — `Accept-Encoding`/`Content-Encoding` are relayed verbatim (never decoded), so the upstream can compress for the real client.
-- **Streaming bodies** — `Content-Length` and chunked request bodies are relayed, and response bodies stream straight from libcurl to the client.
+- **Streaming bodies** — `Content-Length` and chunked request bodies are relayed, and response bodies stream straight from libcurl to the client. The proxy answers `Expect: 100-continue` itself (it sends `100 Continue` before pulling the body) and does not relay the header upstream.
 - **TLS** — HTTPS upstreams, with an opt-in `insecure` mode that skips certificate verification.
 - **Mature upstream engine** — upstream transfers are driven directly against the system libcurl.
 
@@ -134,8 +134,9 @@ Or from a config file:
 | `--upstream-host=<scheme://authority>` | Use a single catch-all upstream. Conflicts if the config already defines upstreams. |
 | `--access-control-allow-origin=<value>` | Default CORS origin swapped into responses (otherwise `*`). |
 | `--interface=<name>` | Default upstream-facing network interface (e.g. `eth0`). |
-| `--verbose`, `-v` | Print per-request proxy logs. |
+| `--verbose`, `-v` | Print verbose proxy logs (config dump at startup, per-upstream details, extra per-request diagnostics). |
 | `--verbose-upstream` | Enable libcurl verbose logging of upstream transactions (to stderr). |
+| `--silent` | Hide info-level log messages. The per-request summary line (printed by default) and other info output are suppressed; warning/error messages still print. |
 
 ### Config file
 
@@ -213,13 +214,14 @@ Each rule rewrites the client path before forwarding:
 
 - `type` is `"plain"` (a strict prefix match) or `"regex"` (a full-match pattern rewrite). It defaults to `"plain"` when omitted.
 - **`plain`** — `local` is the client-facing prefix to strip (`""` or `"/"` matches any path); `remote` is the upstream prefix to splice in (`""` or `"/"` maps to the upstream root). The client remainder is spliced under `remote` into a clean absolute path.
-- **`regex`** — `local` is a regular expression that must match the **entire** client path (a partial match is a non-match); it is compiled once at config load, so a malformed pattern is rejected at startup. `remote` is an upstream template that may reference capture groups — `$0` is the whole match, `$1`/`$2`/… are the groups. The rendered template is normalized to a clean absolute path.
+- **`regex`** — `local` is a regular expression that must match the **entire** client path (a partial match is a non-match); it is compiled once at config load, so a malformed pattern is rejected at startup. `remote` is an upstream template that may reference capture groups — `$0` is the whole match, `$1`/`$2`/… are the groups (single-digit group numbers; a `$` not followed by a digit, or pointing at a group that does not exist, is emitted literally). The rendered template is normalized to a clean absolute path.
 
 ```json
 { "type": "regex", "local": "/api/product/([0-9]+)/info", "remote": "/api/product/info/$1" }
 ```
 
 - The first matching rule wins (upstream order, then rule order). If no rule matches, the first upstream with no `path` rules forwards the path unchanged; if there is none, the request 404s.
+- Client framing violations are the client's fault, not the upstream's: a malformed request head, an incomplete or malformed body, or a premature client close is answered with `400` (an oversized head with `431`), while upstream failures are `502`.
 
 #### Header overrides
 

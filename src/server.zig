@@ -82,7 +82,7 @@ pub const Server = struct {
             if (self.bind_address) |bind_ip| {
                 const seed = address.Address.unspecified4(self.port);
                 break :blk seed.parseIp(bind_ip) catch {
-                    log.err("invalid bind address: {s}", .{ bind_ip });
+                    log.err("invalid bind address: {s}", .{bind_ip});
                     return error.InvalidBindAddress;
                 };
             } else {
@@ -105,7 +105,7 @@ pub const Server = struct {
                 // A wake or the shutdown itself can surface as an accept error;
                 // if shutdown was requested treat it as a clean stop.
                 if (@atomicLoad(bool, &self.shutdown_flag, .acquire)) return;
-                log.err("accept: {any}", .{ err });
+                log.err("accept: {any}", .{err});
                 return err;
             };
             if (@atomicLoad(bool, &self.shutdown_flag, .acquire)) {
@@ -152,9 +152,9 @@ fn wakeListener(bound: address.Address) void {
     switch (target.family) {
         .ip4 => {
             const ip = (@as(u32, target.bytes[0]) << 24) |
-                       (@as(u32, target.bytes[1]) << 16) |
-                       (@as(u32, target.bytes[2]) << 8) |
-                       @as(u32, target.bytes[3]);
+                (@as(u32, target.bytes[1]) << 16) |
+                (@as(u32, target.bytes[2]) << 8) |
+                @as(u32, target.bytes[3]);
             const sa = posix.sockaddr.in{
                 .port = std.mem.nativeToBig(u16, target.port),
                 .addr = std.mem.nativeToBig(u32, ip),

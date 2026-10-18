@@ -27,19 +27,43 @@ pub fn classifyTimeout(elapsed_ms: u64, connect_ms: u64, overall_ms: u64) Timeou
     return if (elapsed_ms <= (connect_ms + overall_ms) / 2) .connect else .overall;
 }
 
+/// The HTTP status for a request-head/framing parse failure: oversized heads
+/// are 431, an out-of-memory is a proxy fault (500), everything else is a
+/// client error (400).
+fn headParseErrorStatus(err: parser.ParseError) u16 {
+    return switch (err) {
+        parser.ParseError.HeaderTooLarge, parser.ParseError.TooManyHeaders => 431,
+        parser.ParseError.OutOfMemory => 500,
+        else => 400,
+    };
+}
+
+/// True when the client sent `Expect: 100-continue` (case-insensitive).
+fn wants100Continue(fields: []const parser.Field) bool {
+    for (fields) |f| {
+        if (std.ascii.eqlIgnoreCase(f.name, "Expect") and std.ascii.findIgnoreCase(f.value, "100-continue") != null) return true;
+    }
+    return false;
+}
+
 const Self = @This();
 
 config: *const config_mod.Config,
 router: router_mod.Router,
 verbose: bool,
+/// The --silent flag. When true, info-level log messages are suppressed
+/// process-wide (see the log function in main.zig), and the per-request line
+/// in forward() is skipped.
+silent: bool,
 
 pub const Forwarder = Self;
 
-pub fn init(config: *const config_mod.Config, verbose: bool) !Self {
+pub fn init(config: *const config_mod.Config, verbose: bool, silent: bool) !Self {
     return .{
         .config = config,
         .router = router_mod.Router.init(config.upstream),
         .verbose = verbose,
+        .silent = silent,
     };
 }
 
@@ -49,8 +73,10 @@ pub fn handle(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) vo
     self.forward(allocator, socket) catch |err| {
         switch (err) {
             // Benign close, and upstream errors already reported by forward().
-            error.ClientClosed, error.OutOfMemory, error.Curl => {},
-            else => log.err("request error: {any}", .{ err }),
+            error.ClientClosed, error.Curl => {},
+            // A mid-request OOM is not benign: log it so it is diagnosable.
+            error.OutOfMemory => log.err("request: out of memory", .{}),
+            else => log.err("request error: {any}", .{err}),
         }
     };
 }
@@ -147,6 +173,19 @@ const ChunkedStream = struct {
     }
 };
 
+/// A client-side fault detected while streaming the request body (or writing
+/// the response back). When set on the Ctx, a failed transfer is the client's
+/// fault: forward() answers 400 and blames the client in the log, not the
+/// upstream.
+const ClientFault = error{
+    /// The client closed the connection (or its write half) early.
+    ClientClosed,
+    /// The client sent fewer bytes than the declared Content-Length.
+    ShortBody,
+    /// The client's chunked body is malformed or lacks its terminator.
+    MalformedChunked,
+};
+
 /// Per-connection state shared with the three libcurl callbacks. `tail` and
 /// `chunked_stream` are owned here (freed in deinit); `socket`/
 /// `response_overrides` borrow from the caller.
@@ -158,6 +197,9 @@ const Ctx = struct {
     tail_pos: usize,
     body_remaining: usize,
     chunked_stream: ?*ChunkedStream,
+    /// A client-side fault that failed the transfer (see ClientFault). When
+    /// set, forward() answers 400 and blames the client in the log.
+    client_fault: ?ClientFault = null,
     head_buf: std.array_list.Managed(u8),
     head_done: bool,
     response_status: u16,
@@ -201,13 +243,33 @@ const Ctx = struct {
                 }
                 if (self.body_remaining == 0) return 0;
                 const want = @min(self.body_remaining, out.len);
-                const n = try self.socket.read(out[0..want]);
+                const n = self.socket.read(out[0..want]) catch {
+                    // The client went away mid-body: abort the upload and let
+                    // forward() report the fault (400).
+                    self.client_fault = ClientFault.ClientClosed;
+                    return 0;
+                };
+                if (n == 0) {
+                    // EOF before the declared Content-Length bytes arrived:
+                    // the body is shorter than declared (client violation).
+                    self.client_fault = ClientFault.ShortBody;
+                    return 0;
+                }
                 self.body_remaining -= n;
                 return n;
             },
             .chunked => {
                 const cs = self.chunked_stream orelse return error.Bug;
-                return cs.read(out);
+                return cs.read(out) catch |err| switch (err) {
+                    error.ChunkedBodyIncomplete, error.BadRequest => {
+                        self.client_fault = ClientFault.MalformedChunked;
+                        return 0;
+                    },
+                    error.ClientClosed => {
+                        self.client_fault = ClientFault.ClientClosed;
+                        return 0;
+                    },
+                };
             },
         }
     }
@@ -234,11 +296,21 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
         const buf = head_buf[0..total];
         head_res = parser.parseRequestHead(buf, .{}) catch |err| switch (err) {
             parser.ParseError.Incomplete => continue,
-            else => return error.BadRequest,
+            else => {
+                const status = headParseErrorStatus(err);
+                try writeError(socket, allocator, status);
+                log.info("[proxy] malformed request head ({any}) -> {d}", .{ err, status });
+                return;
+            },
         };
         blk = parser.parseHeaderBlock(buf, head_res.headEnd, &fields, .{}) catch |err| switch (err) {
             parser.ParseError.Incomplete => continue,
-            else => return error.BadRequest,
+            else => {
+                const status = headParseErrorStatus(err);
+                try writeError(socket, allocator, status);
+                log.info("[proxy] malformed request head ({any}) -> {d}", .{ err, status });
+                return;
+            },
         };
         break :read_head;
     }
@@ -258,15 +330,31 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
 
     // 3. Build the upstream URL (host ++ rewritten, normalized path).
     const remote_path = route.remote_path;
-    const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ upstream.host, remote_path });
+    const url = try allocator.print("{s}{s}", .{ upstream.host, remote_path });
     defer allocator.free(url);
-    const url_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{ url }, 0);
+    const url_z = try allocator.printSentinel("{s}", .{url}, 0);
     defer allocator.free(url_z);
     if (self.verbose) log.info("[proxy] {s:<7} {s} -> {s}", .{ method, path, url });
 
     // 4. Decide body framing from headers, never from the method: GET/DELETE/
     //    HEAD may carry a body too.
-    const framing = parser.decideFraming(field_slice, false, 0, method.len) catch return error.BadRequest;
+    const framing = parser.decideFraming(field_slice, false, 0, method.len) catch |err| {
+        // CL/TE smuggling defenses and bad Content-Length values: the client
+        // sent contradictory framing -> 400.
+        const status = headParseErrorStatus(err);
+        try writeError(socket, allocator, status);
+        log.info("[proxy] bad request framing ({any}) -> {d}", .{ err, status });
+        return;
+    };
+
+    // 4b. If the client asked for 100-continue (and the request carries a
+    //     body), grant it before pulling the body. Expect is never relayed to
+    //     the upstream (see headers.zig), so the upstream never sends its own
+    //     100 — this is the only interim the client will see.
+    if (framing.framing != .none and wants100Continue(field_slice)) {
+        socket.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch return error.ClientClosed;
+        if (self.verbose) log.info("[proxy] sent 100 Continue to client ({s} {s})", .{ method, path });
+    }
 
     // 5. Seed context with any body bytes already read alongside the head.
     const tail_start = blk.end;
@@ -334,7 +422,7 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
     // 7. Run the transfer, with an HTTP/1.1 fallback for "auto". The request
     //    body is pulled via the read callback, the response head pushed via the
     //    header callback, and the body streamed via the write callback.
-    const method_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{ method }, 0);
+    const method_z = try allocator.printSentinel("{s}", .{method}, 0);
     defer allocator.free(method_z);
     // "auto" may fall back to HTTP/1.1, but only when the request body is
     // re-sendable. Both .socket and .chunked consume the client socket on the
@@ -353,6 +441,15 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
                 use_fallback = true;
                 continue;
             }
+            if (ctx.client_fault) |fault| {
+                // A client-side framing fault (premature close, short or
+                // malformed body, client gone mid-response): the request is
+                // the client's fault -> 400, and the log blames the client, not
+                // the upstream.
+                log.info("client error: {s} {s} -> {s} ({any})", .{ method, path, url, fault });
+                if (!ctx.head_done) try writeError(socket, allocator, 400);
+                return;
+            }
             if (err == error.Curl) {
                 // Report the upstream failure with the libcurl reason so the log
                 // says which upstream failed and why. A timeout is tagged with
@@ -370,13 +467,18 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
                 } else {
                     log.err("upstream error: {s} {s} -> {s} ({s})", .{ method, path, url, ctx.curl_error orelse "unknown libcurl error" });
                 }
+                if (!ctx.head_done) try writeError(socket, allocator, 502);
+                return error.Curl;
             }
-            if (!ctx.head_done) try writeError(socket, allocator, 502);
+            // attempt() itself failed before the transfer (e.g. OOM building
+            // the request): a proxy fault, not the upstream's.
+            if (!ctx.head_done) try writeError(socket, allocator, if (err == error.OutOfMemory) 500 else 502);
             return err;
         };
         break;
     }
-    log.info("{s:<4} {s:<32} -> {s:<32} {d} ({d}us)", .{ method, path, remote_path, ctx.response_status, elapsedUs(start, socket.io) });
+    // Printed unless --silent: the routine per-request summary line.
+    if (!self.silent) log.info("{s:<4} {s:<32} -> {s:<32} {d} ({d}us)", .{ method, path, remote_path, ctx.response_status, elapsedUs(start, socket.io) });
 }
 
 /// Configure a fresh easy handle and run one transfer attempt at `http_version`.
@@ -390,7 +492,7 @@ fn attempt(
     url_z: [:0]const u8,
     upstream: *const config_mod.Upstream,
     req_headers: []const [:0]const u8,
-    method_z: []const u8,
+    method_z: [:0]const u8,
     http_version: curl.Easy.HttpVersion,
 ) !void {
     // Drive libcurl's C API directly. The zig-curl `Easy` wrapper hides its raw
@@ -422,7 +524,7 @@ fn attempt(
     }
     try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_CUSTOMREQUEST, method_z.ptr), &diag);
     if (upstream.effectiveInterface(self.config.interface)) |iface| {
-        const iface_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{ iface }, 0);
+        const iface_z = try allocator.printSentinel("{s}", .{iface}, 0);
         defer allocator.free(iface_z);
         try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_INTERFACE, iface_z.ptr), &diag);
     }
@@ -486,6 +588,7 @@ fn resetForRetry(ctx: *Ctx) void {
     ctx.curl_error = null;
     ctx.timeout_kind = null;
     ctx.timeout_elapsed_ms = null;
+    ctx.client_fault = null;
     ctx.head_buf.clearRetainingCapacity();
     ctx.tail_pos = 0;
 }
@@ -499,32 +602,53 @@ fn elapsedUs(start: std.Io.Timestamp, io: std.Io) i64 {
 fn readCallback(buffer: ?*anyopaque, size: usize, nmemb: usize, user_data: ?*anyopaque) callconv(.c) usize {
     const ud = user_data orelse return curl.libcurl.CURL_READFUNC_ABORT;
     const buf = buffer orelse return curl.libcurl.CURL_READFUNC_ABORT;
-    const ctx: *Ctx = @alignCast(@ptrCast(ud));
+    const ctx: *Ctx = @ptrCast(@alignCast(ud));
     const max_len = size * nmemb;
     const ptr: [*]u8 = @ptrCast(buf);
     const out: []u8 = ptr[0..max_len];
-    return ctx.readBody(out) catch curl.libcurl.CURL_READFUNC_ABORT;
+    const n = ctx.readBody(out) catch return curl.libcurl.CURL_READFUNC_ABORT;
+    if (ctx.client_fault != null) {
+        // A client-side fault (short or malformed body, premature close).
+        // Abort the transfer NOW instead of returning 0: libcurl treats a 0
+        // as "upload done" and would silently forward the truncated body and
+        // wait for the response, leaving a half-sent request hanging upstream.
+        return curl.libcurl.CURL_READFUNC_ABORT;
+    }
+    return n;
 }
 
 fn writeCallback(buffer: ?*anyopaque, size: usize, nmemb: usize, user_data: ?*anyopaque) callconv(.c) usize {
     const ud = user_data orelse return 0;
     const buf = buffer orelse return 0;
-    const ctx: *Ctx = @alignCast(@ptrCast(ud));
+    const ctx: *Ctx = @ptrCast(@alignCast(ud));
     const n = size * nmemb;
     const ptr: [*]const u8 = @ptrCast(buf);
     const data: []const u8 = ptr[0..n];
-    ctx.socket.writeAll(data) catch return 0;
+    ctx.socket.writeAll(data) catch {
+        // The client went away mid-response: abort the transfer and attribute
+        // the failure to the client, not the upstream.
+        ctx.client_fault = ClientFault.ClientClosed;
+        return 0;
+    };
     return n;
 }
+
+/// Maximum bytes of response head (status line + headers) buffered before the
+/// terminating blank line. A head larger than this aborts the transfer (502).
+const MAX_RESPONSE_HEAD_BYTES = 64 * 1024;
 
 fn headerCallback(buffer: ?*anyopaque, size: usize, nmemb: usize, user_data: ?*anyopaque) callconv(.c) usize {
     const ud = user_data orelse return 0;
     const buf = buffer orelse return 0;
-    const ctx: *Ctx = @alignCast(@ptrCast(ud));
+    const ctx: *Ctx = @ptrCast(@alignCast(ud));
     const n = size * nmemb;
     const ptr: [*]const u8 = @ptrCast(buf);
     const data: []const u8 = ptr[0..n];
     if (ctx.head_done) return n; // ignore trailer bytes
+    // Bound the head: an upstream that streams headers without a terminating
+    // blank line must not grow this buffer without limit (thread-per-connection
+    // would amplify it).
+    if (ctx.head_buf.items.len + n > MAX_RESPONSE_HEAD_BYTES) return 0;
     ctx.head_buf.appendSlice(data) catch return 0;
     if (std.mem.indexOf(u8, ctx.head_buf.items, "\r\n\r\n")) |blank| {
         const raw_head = ctx.head_buf.items[0 .. blank + 4];
@@ -537,12 +661,34 @@ fn headerCallback(buffer: ?*anyopaque, size: usize, nmemb: usize, user_data: ?*a
             http2_head = fixHttp2Head(ctx.allocator, raw_head) catch return 0;
             head_bytes = http2_head.?;
         }
-        const head_res = parser.parseResponseHead(head_bytes, .{}) catch return 0;
+        const head_res = parser.parseResponseHead(head_bytes, .{}) catch {
+            if (http2_head) |s| ctx.allocator.free(s);
+            return 0;
+        };
+        if (head_res.statusCode < 200) {
+            // A 1xx interim response (100 Continue, 103 Early Hints, ...) is
+            // NOT the final response: libcurl passes 1xx blocks to this
+            // callback, and relaying one as the final head would break the
+            // client. Drop this head block and keep accumulating for the
+            // real one.
+            defer if (http2_head) |s| ctx.allocator.free(s);
+            const keep_from = blank + 4;
+            const keep_len = ctx.head_buf.items.len - keep_from;
+            if (keep_len > 0) std.mem.copyForwards(u8, ctx.head_buf.items[0..keep_len], ctx.head_buf.items[keep_from..]);
+            ctx.head_buf.items = ctx.head_buf.items[0..keep_len];
+            return n;
+        }
         ctx.response_status = head_res.statusCode;
         const status_line = head_bytes[0 .. head_res.headEnd - 2];
         var fields: [parser.DEFAULT_MAX_HEADERS]parser.Field = undefined;
-        const blk = parser.parseHeaderBlock(head_bytes, head_res.headEnd, &fields, .{}) catch return 0;
-        const resp_head = headers_mod.buildResponseHead(ctx.allocator, status_line, fields[0..blk.count], ctx.response_overrides, ctx.default_origin) catch return 0;
+        const blk = parser.parseHeaderBlock(head_bytes, head_res.headEnd, &fields, .{}) catch {
+            if (http2_head) |s| ctx.allocator.free(s);
+            return 0;
+        };
+        const resp_head = headers_mod.buildResponseHead(ctx.allocator, status_line, fields[0..blk.count], ctx.response_overrides, ctx.default_origin) catch {
+            if (http2_head) |s| ctx.allocator.free(s);
+            return 0;
+        };
         defer {
             if (http2_head) |s| ctx.allocator.free(s);
             ctx.allocator.free(resp_head);
@@ -576,11 +722,11 @@ fn writeError(socket: *const tcp.Socket, allocator: std.mem.Allocator, code: u16
     // defer (not errdefer): the success path writes the body and returns void,
     // so errdefer would skip this and leak buf on every error response.
     defer buf.deinit();
-    const sl = try std.fmt.allocPrint(allocator, "HTTP/1.1 {d} {s}\r\n", .{ code, reason_phrase });
+    const sl = try allocator.print("HTTP/1.1 {d} {s}\r\n", .{ code, reason_phrase });
     defer allocator.free(sl);
     try buf.appendSlice(sl);
     try buf.appendSlice("Content-Type: text/plain\r\n");
-    const cl = try std.fmt.allocPrint(allocator, "Content-Length: {d}\r\n", .{ reason_phrase.len + 1 });
+    const cl = try allocator.print("Content-Length: {d}\r\n", .{reason_phrase.len + 1});
     defer allocator.free(cl);
     try buf.appendSlice(cl);
     try buf.appendSlice("Connection: close\r\n\r\n");

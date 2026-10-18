@@ -2,12 +2,14 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    // Production reverse proxy defaults to ReleaseFast. Debug builds are forced
-    // to ReleaseFast because the blocking accept() loop is woken by closing the
-    // listening socket on shutdown, which surfaces EBADF; the stdlib treats
-    // EBADF on accept as a programmer bug in Debug mode and panics.
-    var optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .fast });
-    if (optimize == .debug) optimize = .fast;
+    // Production reverse proxy: ReleaseFast by default; pass -Drelease=false
+    // for a Debug build. Debug was verified clean for the shutdown path (the
+    // blocking accept loop is woken by a throwaway connection, never by
+    // closing the listener, so no EBADF surfaces).
+    const optimize = if (b.option(bool, "release", "optimize for end users") orelse true)
+        std.builtin.Optimize.fast
+    else
+        std.builtin.Optimize.debug;
 
     // curl — link against the system libcurl rather than vendoring it.
     const curl_dep = b.dependency("curl", .{

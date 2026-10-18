@@ -47,7 +47,7 @@ pub const RewriteResult = struct {
 /// string in `buildPathMapping`.
 pub const PathMapping = struct {
     /// Match type, e.g. "plain" or "regex".
-    @"type": []const u8,
+    type: []const u8,
     /// The client-facing pattern: a literal prefix for "plain", a regular
     /// expression for "regex".
     local: []const u8,
@@ -103,7 +103,7 @@ pub fn buildPathMapping(
         const rewrite: *const fn (*const PathMapping, PathCtx) RewriteError!?RewriteResult =
             if (isRoot(local) and isRoot(remote)) directRewrite else plainRewrite;
         return PathMapping{
-            .@"type" = @"type",
+            .type = @"type",
             .local = local,
             .remote = remote,
             .rewrite = rewrite,
@@ -120,7 +120,7 @@ pub fn buildPathMapping(
         };
         data.allocator = allocator;
         return PathMapping{
-            .@"type" = @"type",
+            .type = @"type",
             .local = local,
             .remote = remote,
             .rewrite = regexRewrite,
@@ -150,7 +150,7 @@ fn directRewrite(self: *const PathMapping, ctx: PathCtx) RewriteError!?RewriteRe
 fn plainRewrite(self: *const PathMapping, ctx: PathCtx) RewriteError!?RewriteResult {
     const path = ctx.path;
     if (!std.mem.startsWith(u8, path, self.local)) return null;
-    const rest = path[self.local.len ..];
+    const rest = path[self.local.len..];
     const spliced = try splicedPath(ctx.allocator, self.remote, rest);
     return .{ .path = spliced, .owned = true };
 }
@@ -162,7 +162,7 @@ fn plainRewrite(self: *const PathMapping, ctx: PathCtx) RewriteError!?RewriteRes
 fn regexRewrite(self: *const PathMapping, ctx: PathCtx) RewriteError!?RewriteResult {
     // A regex rule always carries its compiled engine (set in buildPathMapping).
     if (self.data) |d| {
-        const data: *const RegexData = @alignCast(@ptrCast(d));
+        const data: *const RegexData = @ptrCast(@alignCast(d));
         const opt = data.engine.find(ctx.path) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return RewriteError.MatchFailed,
@@ -191,7 +191,7 @@ fn regexRewrite(self: *const PathMapping, ctx: PathCtx) RewriteError!?RewriteRes
 /// allocator; config-built rules are reclaimed by the arena instead.
 fn regexDeinit(self: *const PathMapping) void {
     if (self.data) |d| {
-        const data: *const RegexData = @alignCast(@ptrCast(d));
+        const data: *const RegexData = @ptrCast(@alignCast(d));
         const engine = @as(*regex_mod.Regex, @constCast(&data.engine));
         engine.deinit();
         self.data_allocator.destroy(@constCast(data));
@@ -212,11 +212,11 @@ fn splicedPath(allocator: std.mem.Allocator, remote_prefix: []const u8, rest: []
     while (r.len > 0 and r[0] == '/') r = r[1..];
 
     if (root) {
-        if (r.len == 0) return std.fmt.allocPrint(allocator, "/", .{});
-        return std.fmt.allocPrint(allocator, "/{s}", .{ r });
+        if (r.len == 0) return allocator.print("/", .{});
+        return allocator.print("/{s}", .{r});
     }
-    if (r.len == 0) return std.fmt.allocPrint(allocator, "{s}", .{ b });
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ b, r });
+    if (r.len == 0) return allocator.print("{s}", .{b});
+    return allocator.print("{s}/{s}", .{ b, r });
 }
 
 /// Render a `remote` template against a match, substituting `$0` (the whole
@@ -258,6 +258,6 @@ fn applyReplacement(allocator: std.mem.Allocator, template: []const u8, match: r
 fn normalizeRemote(allocator: std.mem.Allocator, s: []const u8) RewriteError![]u8 {
     var r = s;
     while (r.len > 0 and r[0] == '/') r = r[1..];
-    if (r.len == 0) return std.fmt.allocPrint(allocator, "/", .{});
-    return std.fmt.allocPrint(allocator, "/{s}", .{ r });
+    if (r.len == 0) return allocator.print("/", .{});
+    return allocator.print("/{s}", .{r});
 }
