@@ -5,6 +5,7 @@ const Config = config_mod.Config;
 const router_mod = @import("router");
 const headers_mod = @import("headers");
 const forward_mod = @import("forward");
+const server_mod = @import("server");
 const httpx = @import("httpx");
 const tcp = httpx.tcp;
 const parser = httpx.http1.parser;
@@ -1029,7 +1030,7 @@ test "headers: buildResponseHead overrides Access-Control-Allow-Origin" {
 // exercising the full relay path (request body in, response head+body out).
 // ---------------------------------------------------------------------------
 
-const IntError = error{ BindFailed, ConnectFailed, RelayFailed };
+const IntError = error{ BindFailed, ConnectFailed, RelayFailed, KillFailed };
 
 /// Read a request head (up to the blank line) plus its Content-Length body from
 /// `socket`, returning the content-length (0 if the head carried none or the
@@ -1038,6 +1039,7 @@ fn readUpstreamRequest(socket: tcp.Socket) usize {
     var buf: [16384]u8 = undefined;
     var total: usize = 0;
     var cl: usize = 0;
+    var tail_start: usize = 0; // index just past the head; body bytes may already be buffered there
     head: while (true) {
         if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |_| {
             const head_bytes = buf[0..total];
@@ -1049,15 +1051,20 @@ fn readUpstreamRequest(socket: tcp.Socket) usize {
                     cl = std.fmt.parseInt(usize, f.value, 10) catch return cl;
                 }
             }
+            tail_start = blk.end;
             break :head;
         }
         const n = socket.read(buf[total..]) catch return cl;
         if (n == 0) return cl;
         total += n;
     }
-    var body_read: usize = 0;
+    // The first read may have pulled body bytes alongside the head (curl sends
+    // head and body as separate writes a few microseconds apart; on a loaded
+    // runner they can coalesce in the kernel buffer). Count what is already
+    // buffered instead of re-reading it from the socket.
+    var body_read: usize = total - tail_start;
     while (body_read < cl) {
-        const n = socket.read(buf[total + body_read ..]) catch return cl;
+        const n = socket.read(buf[tail_start + body_read ..]) catch return cl;
         if (n == 0) return cl;
         body_read += n;
     }
@@ -1109,10 +1116,13 @@ fn relayRequest(io: std.Io, allocator: std.mem.Allocator, request: []const u8) !
     defer upstream.close(io);
     const upstream_port = upstream.localPort();
 
-    // Forwarder configured to route everything to that upstream.
+    // Forwarder configured to route everything to that upstream. The transfer
+    // is bounded: a localhost relay completes in milliseconds, so a stuck
+    // transfer (any future deadlock in the proxy or this test) fails in
+    // seconds with a 502 instead of riding the 15-minute default timeout.
     const upstream_host = try allocator.print("http://127.0.0.1:{d}", .{upstream_port});
     defer allocator.free(upstream_host);
-    const cfg_json = try allocator.print("{{\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
+    const cfg_json = try allocator.print("{{\"timeout_ms\":5000,\"connect_timeout_ms\":1000,\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
     defer allocator.free(cfg_json);
     var cfg = try Config.load(io, allocator, null, cfg_json);
     defer cfg.deinit();
@@ -1280,7 +1290,7 @@ fn relayChunkedRequest(io: std.Io, allocator: std.mem.Allocator, request: []cons
 
     const upstream_host = try allocator.print("http://127.0.0.1:{d}", .{upstream_port});
     defer allocator.free(upstream_host);
-    const cfg_json = try allocator.print("{{\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
+    const cfg_json = try allocator.print("{{\"timeout_ms\":5000,\"connect_timeout_ms\":1000,\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
     defer allocator.free(cfg_json);
     var cfg = try Config.load(io, allocator, null, cfg_json);
     defer cfg.deinit();
@@ -1425,40 +1435,51 @@ test "integration: small overall timeout is hit (502, no hang)" {
 // ---------------------------------------------------------------------------
 
 const N_CONCURRENT: usize = 5;
-/// The barrier's give-up deadline, as a wall-clock interval read from the
-/// socket's Io clock (0.17 removed std.time timestamps, so std.Io.Timestamp is
-/// used). Each wait iteration yields the CPU (std.Thread.yield), so a handler
-/// waiting at the barrier never starves the other handler threads that still
-/// have to reach it. This matters on a small, contended runner (CI): a tight
-/// spin there hogs a core and the N-1 stragglers never make progress in time,
-/// so a healthy concurrent proxy gets misreported as not reaching the barrier.
-/// The deadline bounds how long a NON-concurrent proxy keeps a handler waiting
-/// before the test fails instead of hanging; it must comfortably exceed the
-/// stagger between the N handler threads arriving, or a healthy proxy can be
-/// misreported as serial. A yield count (the previous bound) was too coarse: on
-/// a contended runner 10M yields elapse in well under a second, before the
-/// stragglers arrive, so the barrier was misreported as unreached. A wall-clock
-/// deadline is runner-independent. It stays below the overall timeout (60000ms)
-/// so a slow-but-concurrent barrier still 200s rather than 502s.
-const BARRIER_TIMEOUT_NS: i64 = 20 * 1_000_000_000; // 20s
+/// The barrier's give-up deadline. Waiters block on a futex-backed
+/// std.Io.Semaphore, so a handler waiting at the barrier consumes NO CPU: on a
+/// small, contended runner (CI, 2 vCPUs) the N-1 waiters cannot starve the
+/// straggler that still has to reach the barrier (a std.Thread.yield spin loop
+/// used to hog both cores there, and a healthy concurrent proxy was
+/// misreported as not reaching the barrier). The deadline bounds how long a
+/// NON-concurrent proxy keeps a handler waiting before the test fails instead
+/// of hanging; it must comfortably exceed the stagger between the N handler
+/// threads arriving, or a healthy proxy can be misreported as serial. A
+/// wall-clock deadline is runner-independent. It stays below the overall
+/// timeout (60000ms) so a slow-but-concurrent barrier still 200s rather than
+/// 502s.
+const BARRIER_TIMEOUT_MS: i64 = 30_000; // 30s
 var in_flight: usize = 0;
 var barrier_reached: bool = true;
+/// Gate for the barrier: the Nth in-flight handler posts N-1 permits, releasing
+/// every handler already waiting. Permits persist, so posting before a waiter
+/// has blocked yet is harmless.
+var barrier_gate: std.Io.Semaphore = .{};
 
 /// Upstream handler with a concurrency barrier: read the request, count
-/// ourselves in flight, and (cooperatively) wait until all N_CONCURRENT are in
-/// flight at once (proving the proxy handled them concurrently). If the proxy is
-/// not concurrent the barrier is never reached; after BARRIER_TIMEOUT_NS we mark
-/// it unreached so the test fails instead of hanging.
+/// ourselves in flight, and wait until all N_CONCURRENT are in flight at once
+/// (proving the proxy handled them concurrently). If the proxy is not
+/// concurrent the barrier is never reached; after BARRIER_TIMEOUT_MS we mark it
+/// unreached so the test fails instead of hanging.
 fn serveUpstreamBarrier(socket: tcp.Socket, allocator: std.mem.Allocator) void {
     const cl = readUpstreamRequest(socket);
-    _ = @atomicRmw(usize, &in_flight, .Add, 1, .monotonic);
-    const deadline = std.Io.Timestamp.now(socket.io, .awake);
-    while (@atomicLoad(usize, &in_flight, .monotonic) < N_CONCURRENT) {
-        if (deadline.durationTo(std.Io.Timestamp.now(socket.io, .awake)).nanoseconds >= BARRIER_TIMEOUT_NS) {
-            @atomicStore(bool, &barrier_reached, false, .monotonic);
-            break;
-        }
-        std.Thread.yield() catch {};
+    const before = @atomicRmw(usize, &in_flight, .Add, 1, .monotonic);
+    // The RMW returns the OLD count: the Nth arrival sees before == N-1.
+    if (before + 1 < N_CONCURRENT) {
+        // Block on the semaphore (a futex wait: zero CPU while blocked).
+        const timeout = std.Io.Timeout{ .duration = .{
+            .raw = .fromMilliseconds(BARRIER_TIMEOUT_MS),
+            .clock = .awake,
+        } };
+        barrier_gate.waitTimeout(socket.io, timeout) catch |err| switch (err) {
+            // Timeout: the Nth handler never arrived (non-concurrent proxy).
+            // Canceled: the Io context is going away; fail, don't hang.
+            error.Timeout, error.Canceled => {
+                @atomicStore(bool, &barrier_reached, false, .monotonic);
+            },
+        };
+    } else {
+        // The Nth arrival: release the N-1 handlers already waiting.
+        for (0..before) |_| barrier_gate.post(socket.io);
     }
     // The handler always runs to completion (readUpstreamRequest /
     // respondUpstream swallow their errors), so decrement + close on the
@@ -1509,6 +1530,7 @@ test "integration: N concurrent requests are all in flight at once" {
 
     @atomicStore(usize, &in_flight, 0, .monotonic);
     @atomicStore(bool, &barrier_reached, true, .monotonic);
+    barrier_gate = .{ .permits = 0 };
 
     var upstream = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
     defer upstream.close(io);
@@ -1518,7 +1540,7 @@ test "integration: N concurrent requests are all in flight at once" {
     // The upstream handlers hold their connection at the barrier until all N
     // requests are in flight, so the proxy's libcurl transfers wait that long
     // for a response. Give the overall (transfer) timeout a value comfortably
-    // above the 20s barrier so a contended runner (slow barrier) can't trip it
+    // above the 30s barrier so a contended runner (slow barrier) can't trip it
     // and 502 the requests before the barrier is reached, while still bounding
     // the test's worst-case runtime well below the 15min default.
     const cfg_json = try allocator.print("{{\"timeout_ms\":60000,\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
@@ -1605,7 +1627,8 @@ const Relay = struct {
 fn relaySetup(io: std.Io, allocator: std.mem.Allocator, upstream_port: u16) !Relay {
     const upstream_host = try allocator.print("http://127.0.0.1:{d}", .{upstream_port});
     defer allocator.free(upstream_host);
-    const cfg_json = try allocator.print("{{\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
+    // Bounded transfer, see relayRequest.
+    const cfg_json = try allocator.print("{{\"timeout_ms\":5000,\"connect_timeout_ms\":1000,\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
     defer allocator.free(cfg_json);
     const cfg = try Config.load(io, allocator, null, cfg_json);
     const forwarder = try forward_mod.Forwarder.init(cfg, false, false);
@@ -1815,4 +1838,64 @@ test "headers: Host/User-Agent are overridable, framing headers are not" {
         try std.testing.expect(headerContains(out2, "User-Agent: custom-ua"));
         try std.testing.expect(!headerContains(out2, "User-Agent: client/1.0"));
     }
+}
+
+test "integration: SIGINT stops the accept loop (graceful shutdown)" {
+    const allocator = std.heap.page_allocator;
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io;
+
+    var upstream = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
+    defer upstream.close(io);
+    var relay = try relaySetup(io, allocator, upstream.localPort());
+    defer relay.cfg.deinit();
+
+    // Port 0 (ephemeral): the shutdown path under test does not care which
+    // port it binds, and a fixed test port risks collisions.
+    var server = server_mod.Server.init(&relay.forwarder, allocator, io);
+    server.port = 0;
+
+    server.registerSignalHandlers();
+    defer server.deregisterSignalHandlers();
+    const server_thread = try std.Thread.spawn(.{}, serverRun, .{&server});
+
+    // Wait for run() to finish binding: bound_address.port holds the resolved
+    // ephemeral port from just before the accept loop blocks.
+    var spins: u32 = 0;
+    while (server.bound_address.port == 0 and spins < 1000000) {
+        std.Thread.yield() catch {};
+        spins += 1;
+    }
+    try std.testing.expect(server.bound_address.port != 0);
+
+    // One SIGINT to this process: the handler counts it and its wake
+    // connection unblocks the accept loop, so run() returns cleanly and the
+    // thread joins. (A second signal would hard-exit the process — that path
+    // cannot be tested in-process.)
+    std.posix.kill(std.c.getpid(), .INT) catch return IntError.KillFailed;
+    server_thread.join();
+}
+
+fn serverRun(server: *server_mod.Server) void {
+    server.run() catch {};
+}
+
+test "server: requestShutdown reports a repeat signal" {
+    const allocator = std.heap.page_allocator;
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io;
+
+    var upstream = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
+    defer upstream.close(io);
+    var relay = try relaySetup(io, allocator, upstream.localPort());
+    defer relay.cfg.deinit();
+
+    var server = server_mod.Server.init(&relay.forwarder, allocator, io);
+    // Not running: the first call counts and attempts a harmless wake (no
+    // listener to reach), the second reports the repeat — the condition the
+    // signal handler hard-exits on (untestable in-process: _exit).
+    try std.testing.expect(!server.requestShutdown());
+    try std.testing.expect(server.requestShutdown());
 }

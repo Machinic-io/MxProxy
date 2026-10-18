@@ -14,7 +14,16 @@ var g_server: ?*Server = null;
 
 fn handleSignal(sig: posix.SIG) callconv(.c) void {
     _ = sig;
-    if (@atomicLoad(?*Server, &g_server, .monotonic)) |s| s.requestShutdown();
+    if (@atomicLoad(?*Server, &g_server, .monotonic)) |s| {
+        if (s.requestShutdown()) {
+            // A repeat signal while shutdown is already in progress: the
+            // graceful path is stuck (its wake connection could not land) or
+            // the user is pressing again — either way, stop NOW. _exit, not
+            // exit(): we are in signal context, where atexit handlers and
+            // stdio flushing are not safe.
+            std.c._exit(130); // 128 + SIGINT: the conventional signal death
+        }
+    }
 }
 
 /// Accept loop + thread-per-connection + signal-driven shutdown.
@@ -30,9 +39,12 @@ pub const Server = struct {
     /// The resolved address actually bound in run(); used to wake accept().
     /// Defaults to any/0 so a signal before run() binds stays harmless.
     bound_address: address.Address = .{ .family = .ip4, .port = 0 },
-    /// Set by requestShutdown() to wake the blocked accept(). Written by the
-    /// signal handler and read by the accept loop, so accessed atomically.
-    shutdown_flag: bool = false,
+    /// Shutdown signals received: 0 = running, 1 = graceful shutdown requested
+    /// (the accept loop stops), 2+ = a repeat signal arrived while shutdown
+    /// was in progress (the handler hard-exits on it, so the accept loop
+    /// never observes 2+). Written by the signal handler and read by the
+    /// accept loop, so accessed atomically.
+    signal_count: std.atomic.Value(u32) = .init(0),
 
     pub fn init(forwarder: *forward_mod.Forwarder, allocator: std.mem.Allocator, io: std.Io) Self {
         return .{ .forwarder = forwarder, .allocator = allocator, .io = io, .port = forwarder.config.port, .bind_address = forwarder.config.bind_address };
@@ -61,16 +73,25 @@ pub const Server = struct {
         _ = posix.sigaction(posix.SIG.TERM, &sig_act, null);
     }
 
-    /// Request shutdown: raise the flag and wake the blocked accept() with a
-    /// throwaway connection. Both operations are async-signal-safe (an atomic
-    /// store plus socket/connect syscalls), so this may run in signal context.
-    pub fn requestShutdown(self: *Self) void {
-        @atomicStore(bool, &self.shutdown_flag, true, .release);
-        wakeListener(self.bound_address);
+    /// Request a graceful shutdown: count the signal and, on the first one,
+    /// wake the blocked accept() with a throwaway connection. Returns true
+    /// when a shutdown was ALREADY requested, i.e. this is a repeat signal
+    /// (the handler hard-exits on it). All operations are async-signal-safe
+    /// (an atomic fetch-add plus socket/connect syscalls), so this may run in
+    /// signal context.
+    pub fn requestShutdown(self: *Self) bool {
+        const n = self.signal_count.fetchAdd(1, .release);
+        if (n == 0) wakeListener(self.bound_address);
+        return n != 0;
     }
 
     /// Bind, serve, and block until requestShutdown() is called.
     pub fn run(self: *Self) !void {
+        // A signal may have arrived before run(): its wake connection could
+        // not have landed (there was no listener to connect to). Bail before
+        // binding so a Ctrl+C during startup stops the process instantly.
+        if (self.signal_count.load(.acquire) != 0) return;
+
         const listener = try self.allocator.create(tcp.Listener);
         var bound = false;
         defer {
@@ -98,18 +119,29 @@ pub const Server = struct {
             return err;
         };
         bound = true;
+        // Record the port the listener actually bound (it differs from
+        // self.port only for port-0/ephemeral binds) so the wake connection
+        // targets the address the listener listens on.
+        self.bound_address.port = listener.localPort();
         log.info("listening on {s}:{d}", .{ bind_addr.formatBuf(&addr_buf), listener.localPort() });
+
+        // A signal in the bind window above may have woken nothing (the
+        // listener was not up when its wake fired). Bail before blocking on
+        // accept; the loop below would otherwise block until some client
+        // happened to connect.
+        if (self.signal_count.load(.acquire) != 0) return;
 
         while (true) {
             const socket = listener.accept(self.io) catch |err| {
                 // A wake or the shutdown itself can surface as an accept error;
                 // if shutdown was requested treat it as a clean stop.
-                if (@atomicLoad(bool, &self.shutdown_flag, .acquire)) return;
+                if (self.signal_count.load(.acquire) != 0) return;
                 log.err("accept: {any}", .{err});
                 return err;
             };
-            if (@atomicLoad(bool, &self.shutdown_flag, .acquire)) {
+            if (self.signal_count.load(.acquire) != 0) {
                 socket.close();
+                log.info("shutting down", .{});
                 return; // shutdown requested
             }
             const t = std.Thread.spawn(.{}, handleConn, .{ self.forwarder, self.allocator, socket }) catch {
