@@ -248,16 +248,16 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
     const start = std.Io.Timestamp.now(socket.io, .awake);
 
     // 2. Route to an upstream (path rewrite).
-    const route = self.router.resolve(path) orelse {
+    var route = try self.router.resolve(allocator, path) orelse {
         try writeError(socket, allocator, 404);
         if (self.verbose) log.info("[proxy] {s:<7} {s} -> 404 ({d}us)", .{ method, path, elapsedUs(start, socket.io) });
         return;
     };
+    defer route.deinit();
     const upstream = route.upstream;
 
-    // 3. Build the upstream URL (normalized base prefix ++ rewritten rest).
-    const remote_path = try router_mod.Router.splicedPath(allocator, route);
-    defer allocator.free(remote_path);
+    // 3. Build the upstream URL (host ++ rewritten, normalized path).
+    const remote_path = route.remote_path;
     const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ upstream.host, remote_path });
     defer allocator.free(url);
     const url_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{ url }, 0);
@@ -362,7 +362,11 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
                         .connect => "connect timeout",
                         .overall => "overall timeout",
                     };
-                    log.warn("upstream error: {s} {s} -> {s} ({s} after {d}ms)", .{ method, path, url, tag, ctx.timeout_elapsed_ms.? });
+                    // Log at info (not warn): a per-request upstream timeout is a
+                    // routine event (the client already gets a 502), and warn would
+                    // make the timeout test's expected log a test failure — flakily
+                    // attributed to a randomly-adjacent test from the handler thread.
+                    log.info("upstream error: {s} {s} -> {s} ({s} after {d}ms)", .{ method, path, url, tag, ctx.timeout_elapsed_ms.? });
                 } else {
                     log.err("upstream error: {s} {s} -> {s} ({s})", .{ method, path, url, ctx.curl_error orelse "unknown libcurl error" });
                 }

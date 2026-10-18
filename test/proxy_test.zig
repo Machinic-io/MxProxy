@@ -341,7 +341,13 @@ test "config: validation errors" {
     // unknown path type
     try std.testing.expectError(
         config_mod.ConfigError.InvalidPathType,
-        Config.load(io_ctx.io, allocator, null, "{\"upstream\": [{\"host\": \"https://x.com\", \"path\": [{\"type\": \"regex\", \"local\": \"/a\", \"remote\": \"/b\"}]}]}"),
+        Config.load(io_ctx.io, allocator, null, "{\"upstream\": [{\"host\": \"https://x.com\", \"path\": [{\"type\": \"fancy\", \"local\": \"/a\", \"remote\": \"/b\"}]}]}"),
+    );
+    // a "regex" rule whose local does not compile to a valid regular expression
+    // (unbalanced parenthesis) is rejected at load time
+    try std.testing.expectError(
+        config_mod.ConfigError.InvalidRegex,
+        Config.load(io_ctx.io, allocator, null, "{\"upstream\": [{\"host\": \"https://x.com\", \"path\": [{\"type\": \"regex\", \"local\": \"([0-9+\", \"remote\": \"/b\"}]}]}"),
     );
     // port 0
     try std.testing.expectError(
@@ -446,10 +452,10 @@ test "router: prefix rewrite" {
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
-    const route = router.resolve("/example/foo/bar") orelse return error.NoRoute;
+    const route = try router.resolve(allocator, "/example/foo/bar") orelse return error.NoRoute;
+    defer route.deinit();
     try std.testing.expectEqualStrings("https://e.com", route.upstream.host);
-    try std.testing.expectEqualStrings("/", route.remote_prefix);
-    try std.testing.expectEqualStrings("foo/bar", route.rest);
+    try std.testing.expectEqualStrings("/foo/bar", route.remote_path);
 }
 
 test "router: rewrite to a different prefix" {
@@ -460,9 +466,9 @@ test "router: rewrite to a different prefix" {
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
-    const route = router.resolve("/a/x") orelse return error.NoRoute;
-    try std.testing.expectEqualStrings("/b/", route.remote_prefix);
-    try std.testing.expectEqualStrings("x", route.rest);
+    const route = try router.resolve(allocator, "/a/x") orelse return error.NoRoute;
+    defer route.deinit();
+    try std.testing.expectEqualStrings("/b/x", route.remote_path);
 }
 
 test "router: first match wins across upstreams" {
@@ -476,10 +482,10 @@ test "router: first match wins across upstreams" {
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
-    const route = router.resolve("/x/y") orelse return error.NoRoute;
+    const route = try router.resolve(allocator, "/x/y") orelse return error.NoRoute;
+    defer route.deinit();
     try std.testing.expectEqualStrings("https://first.com", route.upstream.host);
-    try std.testing.expectEqualStrings("/1/", route.remote_prefix);
-    try std.testing.expectEqualStrings("y", route.rest);
+    try std.testing.expectEqualStrings("/1/y", route.remote_path);
 }
 
 test "router: catch-all passthrough when no rule matches" {
@@ -494,10 +500,10 @@ test "router: catch-all passthrough when no rule matches" {
 
     const router = router_mod.Router.init(cfg.upstream);
     // non-matching path falls through to the rule-less catch-all upstream
-    const route = router.resolve("/other/thing") orelse return error.NoRoute;
+    const route = try router.resolve(allocator, "/other/thing") orelse return error.NoRoute;
+    defer route.deinit();
     try std.testing.expectEqualStrings("https://default.com", route.upstream.host);
-    try std.testing.expectEqualStrings("", route.remote_prefix);
-    try std.testing.expectEqualStrings("/other/thing", route.rest);
+    try std.testing.expectEqualStrings("/other/thing", route.remote_path);
 }
 
 test "router: no match and no catch-all returns null" {
@@ -509,7 +515,7 @@ test "router: no match and no catch-all returns null" {
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
-    try std.testing.expect(router.resolve("/nope") == null);
+    try std.testing.expect((try router.resolve(allocator, "/nope")) == null);
 }
 
 test "router: root prefix matches everything" {
@@ -521,9 +527,9 @@ test "router: root prefix matches everything" {
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
-    const route = router.resolve("/anything/at/all") orelse return error.NoRoute;
-    try std.testing.expectEqualStrings("/base/", route.remote_prefix);
-    try std.testing.expectEqualStrings("anything/at/all", route.rest);
+    const route = try router.resolve(allocator, "/anything/at/all") orelse return error.NoRoute;
+    defer route.deinit();
+    try std.testing.expectEqualStrings("/base/anything/at/all", route.remote_path);
 }
 
 test "router: first rule wins within a single upstream" {
@@ -538,9 +544,9 @@ test "router: first rule wins within a single upstream" {
 
     const router = router_mod.Router.init(cfg.upstream);
     // Both rules prefix-match /a/b/x, but the first-listed rule wins.
-    const route = router.resolve("/a/b/x") orelse return error.NoRoute;
-    try std.testing.expectEqualStrings("/1/", route.remote_prefix);
-    try std.testing.expectEqualStrings("b/x", route.rest);
+    const route = try router.resolve(allocator, "/a/b/x") orelse return error.NoRoute;
+    defer route.deinit();
+    try std.testing.expectEqualStrings("/1/b/x", route.remote_path);
 }
 
 test "router: later rule matches when earlier does not" {
@@ -554,9 +560,9 @@ test "router: later rule matches when earlier does not" {
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
-    const route = router.resolve("/b/x") orelse return error.NoRoute;
-    try std.testing.expectEqualStrings("/2/", route.remote_prefix);
-    try std.testing.expectEqualStrings("x", route.rest);
+    const route = try router.resolve(allocator, "/b/x") orelse return error.NoRoute;
+    defer route.deinit();
+    try std.testing.expectEqualStrings("/2/x", route.remote_path);
 }
 
 test "router: prefix match is literal, not segment-aware" {
@@ -570,8 +576,8 @@ test "router: prefix match is literal, not segment-aware" {
     const router = router_mod.Router.init(cfg.upstream);
     // "/apifoo" and "/api" do not start with the literal "/api/" prefix, so
     // with no catch-all upstream they must not match at all.
-    try std.testing.expect(router.resolve("/apifoo") == null);
-    try std.testing.expect(router.resolve("/api") == null);
+    try std.testing.expect((try router.resolve(allocator, "/apifoo")) == null);
+    try std.testing.expect((try router.resolve(allocator, "/api")) == null);
 }
 
 test "router: matching exactly the prefix yields empty rest" {
@@ -583,9 +589,9 @@ test "router: matching exactly the prefix yields empty rest" {
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
-    const route = router.resolve("/api/") orelse return error.NoRoute;
-    try std.testing.expectEqualStrings("/base/", route.remote_prefix);
-    try std.testing.expectEqualStrings("", route.rest);
+    const route = try router.resolve(allocator, "/api/") orelse return error.NoRoute;
+    defer route.deinit();
+    try std.testing.expectEqualStrings("/base", route.remote_path);
 }
 
 test "router: a rule match beats the catch-all" {
@@ -600,14 +606,15 @@ test "router: a rule match beats the catch-all" {
 
     const router = router_mod.Router.init(cfg.upstream);
     // The rule-less upstream sits first, but a matching rule elsewhere wins.
-    const hit = router.resolve("/x/y") orelse return error.NoRoute;
+    const hit = try router.resolve(allocator, "/x/y") orelse return error.NoRoute;
+    defer hit.deinit();
     try std.testing.expectEqualStrings("https://specific.com", hit.upstream.host);
-    try std.testing.expectEqualStrings("/", hit.remote_prefix);
-    try std.testing.expectEqualStrings("y", hit.rest);
+    try std.testing.expectEqualStrings("/y", hit.remote_path);
     // Only when no rule matches does the catch-all apply.
-    const fall = router.resolve("/other") orelse return error.NoRoute;
+    const fall = try router.resolve(allocator, "/other") orelse return error.NoRoute;
+    defer fall.deinit();
     try std.testing.expectEqualStrings("https://default.com", fall.upstream.host);
-    try std.testing.expectEqualStrings("/other", fall.rest);
+    try std.testing.expectEqualStrings("/other", fall.remote_path);
 }
 
 test "router: catch-all picks the first rule-less upstream" {
@@ -623,34 +630,34 @@ test "router: catch-all picks the first rule-less upstream" {
 
     const router = router_mod.Router.init(cfg.upstream);
     // Two rule-less upstreams: the first one is the catch-all.
-    const route = router.resolve("/anything") orelse return error.NoRoute;
+    const route = try router.resolve(allocator, "/anything") orelse return error.NoRoute;
+    defer route.deinit();
     try std.testing.expectEqualStrings("https://d1.com", route.upstream.host);
-    try std.testing.expectEqualStrings("", route.remote_prefix);
-    try std.testing.expectEqualStrings("/anything", route.rest);
+    try std.testing.expectEqualStrings("/anything", route.remote_path);
 }
 
-test "router: only the plain type is treated as starts-with" {
-    // Build the upstreams directly (bypassing config validation, which rejects
-    // non-"plain" types) to exercise the resolver's per-type dispatch.
-    const plain = [_]config_mod.PathMapping{
-        .{ .@"type" = "plain", .local = "/a/", .remote = "/p/" },
-    };
-    const plain_up = [_]config_mod.Upstream{ .{ .host = "https://plain.com", .path = &plain } };
-    const plain_router = router_mod.Router.init(&plain_up);
-    // "plain" is a starts-with match: /a/x matches, /b does not.
-    const hit = plain_router.resolve("/a/x") orelse return error.NoRoute;
-    try std.testing.expectEqualStrings("/p/", hit.remote_prefix);
-    try std.testing.expectEqualStrings("x", hit.rest);
-    try std.testing.expect(plain_router.resolve("/b") == null);
-
-    const regex = [_]config_mod.PathMapping{
-        .{ .@"type" = "regex", .local = "/a/", .remote = "/r/" },
-    };
-    const regex_up = [_]config_mod.Upstream{ .{ .host = "https://regex.com", .path = &regex } };
-    const regex_router = router_mod.Router.init(&regex_up);
-    // A non-plain type is not a starts-with matcher, so it never matches.
-    try std.testing.expect(regex_router.resolve("/a/x") == null);
-    try std.testing.expect(regex_router.resolve("/other") == null);
+test "router: plain and regex rules dispatch by type" {
+    const allocator = std.testing.allocator;
+    // One upstream with a plain rule and a regex rule: the first matching rule
+    // wins, and each rule dispatches to its own implementation via the vtable.
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+    var cfg = try loadConfig(allocator, &io_ctx,
+        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [" ++
+        "{\"type\": \"plain\", \"local\": \"/a/\", \"remote\": \"/p/\"}, " ++
+        "{\"type\": \"regex\", \"local\": \"/r/([0-9]+)\", \"remote\": \"/p/$1\"}]}]}");
+    defer cfg.deinit();
+    const router = router_mod.Router.init(cfg.upstream);
+    // The plain rule matches /a/x first.
+    const hit = try router.resolve(allocator, "/a/x") orelse return error.NoRoute;
+    defer hit.deinit();
+    try std.testing.expectEqualStrings("/p/x", hit.remote_path);
+    // The regex rule matches /r/123 (the plain /a/ rule does not).
+    const re = try router.resolve(allocator, "/r/123") orelse return error.NoRoute;
+    defer re.deinit();
+    try std.testing.expectEqualStrings("/p/123", re.remote_path);
+    // Neither rule matches /zzz.
+    try std.testing.expect((try router.resolve(allocator, "/zzz")) == null);
 }
 
 test "router: blank local matches any path" {
@@ -664,14 +671,15 @@ test "router: blank local matches any path" {
     const router = router_mod.Router.init(cfg.upstream);
     // A blank local is a wildcard: it matches any path, and (unlike "/") the
     // empty prefix strips nothing, so the full path is the remainder.
-    const a = router.resolve("/foo") orelse return error.NoRoute;
-    try std.testing.expectEqualStrings("/", a.remote_prefix);
-    try std.testing.expectEqualStrings("/foo", a.rest);
-    const b = router.resolve("/") orelse return error.NoRoute;
-    try std.testing.expectEqualStrings("/", b.remote_prefix);
-    try std.testing.expectEqualStrings("/", b.rest);
-    const c = router.resolve("/x/y/z") orelse return error.NoRoute;
-    try std.testing.expectEqualStrings("/x/y/z", c.rest);
+    const a = try router.resolve(allocator, "/foo") orelse return error.NoRoute;
+    defer a.deinit();
+    try std.testing.expectEqualStrings("/foo", a.remote_path);
+    const b = try router.resolve(allocator, "/") orelse return error.NoRoute;
+    defer b.deinit();
+    try std.testing.expectEqualStrings("/", b.remote_path);
+    const c = try router.resolve(allocator, "/x/y/z") orelse return error.NoRoute;
+    defer c.deinit();
+    try std.testing.expectEqualStrings("/x/y/z", c.remote_path);
 }
 
 test "router: local and remote both / pass the source path through unchanged" {
@@ -683,25 +691,61 @@ test "router: local and remote both / pass the source path through unchanged" {
     defer cfg.deinit();
 
     const router = router_mod.Router.init(cfg.upstream);
-    // local="/" matches any path and strips the leading slash into `rest`;
-    // remote="/" then re-adds it. The spliced upstream path therefore equals
-    // the source path, i.e. the URL passes through unchanged.
+    // local="/" matches any path and strips the leading slash; remote="/" then
+    // re-adds it. The rewritten upstream path therefore equals the source path,
+    // i.e. the URL passes through unchanged.
     const cases = [_][]const u8{ "/", "/a", "/a/b", "/a/b/c/d" };
     for (cases) |path| {
-        const route = router.resolve(path) orelse return error.NoRoute;
-        const spliced = std.mem.concat(allocator, u8, &.{ route.remote_prefix, route.rest }) catch return error.OutOfMemory;
-        defer allocator.free(spliced);
-        try std.testing.expectEqualStrings(path, spliced);
+        const route = try router.resolve(allocator, path) orelse return error.NoRoute;
+        defer route.deinit();
+        try std.testing.expectEqualStrings(path, route.remote_path);
     }
 }
 
+test "router: all-root rule is a direct (identity) mapping" {
+    const allocator = std.testing.allocator;
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+    // Both local and remote omitted (blank is the default) -> the direct path:
+    // it forwards the client path unchanged and borrows it (the route does not
+    // own it, so deinit is a no-op).
+    var cfg = try loadConfig(allocator, &io_ctx,
+        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"plain\"}]}]}");
+    defer cfg.deinit();
+
+    const router = router_mod.Router.init(cfg.upstream);
+    const cases = [_][]const u8{ "/", "/a", "/a/b/c" };
+    for (cases) |path| {
+        const route = try router.resolve(allocator, path) orelse return error.NoRoute;
+        defer route.deinit();
+        try std.testing.expectEqualStrings(path, route.remote_path);
+        try std.testing.expect(!route.owns_remote_path);
+    }
+}
+
+test "router: root local with a non-root remote rewrites (not direct)" {
+    const allocator = std.testing.allocator;
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+    // local="" (root) matches any path, but remote is a real prefix, so this is
+    // a genuine plain rewrite (prepend), NOT the direct/identity path.
+    var cfg = try loadConfig(allocator, &io_ctx,
+        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"plain\", \"local\": \"\", \"remote\": \"/x/\"}]}]}");
+    defer cfg.deinit();
+
+    const router = router_mod.Router.init(cfg.upstream);
+    const route = try router.resolve(allocator, "/a/b") orelse return error.NoRoute;
+    defer route.deinit();
+    try std.testing.expect(route.owns_remote_path);
+    try std.testing.expectEqualStrings("/x/a/b", route.remote_path);
+}
+
 // Helper: resolve `path` and build the full upstream URL exactly as forward
-// does (host ++ normalized spliced path), returning it as an allocated string.
+// does (host ++ rewritten, normalized path), returning it as an allocated string.
 fn resolvedUrl(allocator: Allocator, router: *const router_mod.Router, path: []const u8) ![]u8 {
-    const route = router.resolve(path) orelse return error.NoRoute;
-    const spliced = try router_mod.Router.splicedPath(allocator, route);
-    defer allocator.free(spliced);
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ route.upstream.host, spliced });
+    var route = try router.resolve(allocator, path) orelse return error.NoRoute;
+    defer route.deinit();
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ route.upstream.host, route.remote_path });
 }
 
 test "router: wildcard local passes the source path through under the host" {
@@ -748,6 +792,79 @@ test "router: root remote never doubles the leading slash" {
     const url = try resolvedUrl(allocator, &router, "/model/123/files");
     defer allocator.free(url);
     try std.testing.expectEqualStrings("https://www.printables.com/model/123/files", url);
+}
+
+test "config: regex path rule compiles and decodes" {
+    const allocator = std.testing.allocator;
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+
+    const json = "{\"upstream\": [{\"host\": \"https://x.com\", \"path\": [{\"type\": \"regex\", \"local\": \"/api/product/([0-9]+)/info\", \"remote\": \"/api/product/info/$1\"}]}]}";
+    var cfg = try Config.load(io_ctx.io, allocator, null, json);
+    defer cfg.deinit();
+
+    const p = cfg.upstream[0].path[0];
+    try std.testing.expectEqualStrings("regex", p.@"type");
+    try std.testing.expectEqualStrings("/api/product/([0-9]+)/info", p.local);
+    try std.testing.expectEqualStrings("/api/product/info/$1", p.remote);
+}
+
+test "router: regex rewrites with a capture group" {
+    const allocator = std.testing.allocator;
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+    var cfg = try loadConfig(allocator, &io_ctx,
+        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"regex\", \"local\": \"/api/product/([0-9]+)/info\", \"remote\": \"/api/product/info/$1\"}]}]}");
+    defer cfg.deinit();
+
+    const router = router_mod.Router.init(cfg.upstream);
+    const route = try router.resolve(allocator, "/api/product/1234/info") orelse return error.NoRoute;
+    defer route.deinit();
+    try std.testing.expectEqualStrings("https://e.com", route.upstream.host);
+    try std.testing.expectEqualStrings("/api/product/info/1234", route.remote_path);
+}
+
+test "router: regex requires a full match (partial is a non-match)" {
+    const allocator = std.testing.allocator;
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+    var cfg = try loadConfig(allocator, &io_ctx,
+        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"regex\", \"local\": \"/api/product/([0-9]+)/info\", \"remote\": \"/api/product/info/$1\"}]}]}");
+    defer cfg.deinit();
+
+    const router = router_mod.Router.init(cfg.upstream);
+    // A trailing char makes the match partial (end != path.len): no route.
+    try std.testing.expect((try router.resolve(allocator, "/api/product/1234/infoX")) == null);
+    // A leading char makes the match partial (start != 0): no route.
+    try std.testing.expect((try router.resolve(allocator, "/x/api/product/1234/info")) == null);
+}
+
+test "router: regex with multiple groups" {
+    const allocator = std.testing.allocator;
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+    var cfg = try loadConfig(allocator, &io_ctx,
+        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"regex\", \"local\": \"/a/([0-9]+)-([0-9]+)/b\", \"remote\": \"/x/$1/$2\"}]}]}");
+    defer cfg.deinit();
+
+    const router = router_mod.Router.init(cfg.upstream);
+    const route = try router.resolve(allocator, "/a/12-34/b") orelse return error.NoRoute;
+    defer route.deinit();
+    try std.testing.expectEqualStrings("/x/12/34", route.remote_path);
+}
+
+test "router: regex $0 substitutes the whole match" {
+    const allocator = std.testing.allocator;
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+    var cfg = try loadConfig(allocator, &io_ctx,
+        "{\"upstream\": [{\"host\": \"https://e.com\", \"path\": [{\"type\": \"regex\", \"local\": \"([0-9]+)\", \"remote\": \"/num/$0\"}]}]}");
+    defer cfg.deinit();
+
+    const router = router_mod.Router.init(cfg.upstream);
+    const route = try router.resolve(allocator, "42") orelse return error.NoRoute;
+    defer route.deinit();
+    try std.testing.expectEqualStrings("/num/42", route.remote_path);
 }
 
 fn headerContains(hs: [][:0]const u8, prefix: []const u8) bool {

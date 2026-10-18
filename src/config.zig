@@ -1,10 +1,13 @@
 const std = @import("std");
+const pathmap_mod = @import("pathmap");
 
 pub const ConfigError = error{
     InvalidPort,
     MissingHost,
     InvalidHost,
     InvalidPathType,
+    /// A "regex" path rule whose `local` is not a valid regular expression.
+    InvalidRegex,
     InvalidProtocol,
     UpstreamHostConflict,
     ConfigFileNotFound,
@@ -23,24 +26,36 @@ pub const ConfigError = error{
 /// name absent from the object is passed through unchanged.
 pub const HeaderOverrides = std.json.ArrayHashMap(?[]const u8);
 
-/// A single path rewrite rule. `local` is the client-facing prefix, `remote`
-/// the upstream prefix it maps to. Only "plain" (prefix) matching is supported
-/// for now; the type field keeps the schema open for "regex" later.
-///
-/// A `local` of `""` or `"/"` matches any path (a wildcard/catch-all rule).
-/// `remote` may be `""`, `"/"`, or omitted; all mean the upstream origin
-/// (root), so the request path passes through under the host with the matched
-/// `local` prefix removed. `remote` and the remainder are joined into a clean
-/// absolute path (see `Router.splicedPath`), so a root remote never doubles
-/// the leading slash.
-pub const PathMapping = struct {
-    /// Match type, defaulting to `"plain"` when the key is absent from the
-    /// JSON so an omitted type is a valid plain rule. The only supported type
-    /// today; an explicit other value still fails validation (see
-    /// `Config.validate`).
+/// A single path rewrite rule. Re-exported for convenience; the type and its
+/// plain/regex implementations live in `pathmap`, which also holds the
+/// construction point (`pathmap.buildPathMapping`).
+pub const PathMapping = pathmap_mod.PathMapping;
+
+/// JSON-decodable form of a path rule. Decoded by the JSON parser, then built
+/// into a runtime `PathMapping` (see `Config.load`), which compiles the pattern
+/// for "regex" rules so a malformed regex fails at load time.
+const RawPathMapping = struct {
+    /// Match type, defaulting to `"plain"` when the key is absent from the JSON
+    /// so an omitted type is a valid plain rule.
     @"type": []const u8 = "plain",
-    local: []const u8,
+    /// The client-facing pattern. Defaults to blank ("") when absent, which
+    /// matches any path (the direct/identity case when `remote` is also root).
+    local: []const u8 = "",
     remote: []const u8 = "",
+};
+
+/// JSON-decodable form of an upstream. Decoded by the JSON parser, then built
+/// into a runtime `Upstream` (see `Config.load`).
+const RawUpstream = struct {
+    host: []const u8,
+    interface: ?[]const u8 = null,
+    connect_timeout_ms: ?usize = null,
+    timeout_ms: ?usize = null,
+    insecure: ?bool = null,
+    protocol: []const u8 = "auto",
+    request_headers: HeaderOverrides = .{ .map = .empty },
+    response_headers: HeaderOverrides = .{ .map = .empty },
+    path: []RawPathMapping = &.{},
 };
 
 /// One upstream server. `host` is the full origin URL (scheme://authority).
@@ -124,11 +139,8 @@ const RawConfig = struct {
     timeout_ms: ?usize = null,
     connect_timeout_ms: ?usize = null,
     insecure: ?bool = null,
-    upstream: ?[]Upstream = null,
+    upstream: ?[]RawUpstream = null,
 };
-
-/// The catch-all path rule assumed by the `--upstream-host` override.
-const CatchAllPath = [_]PathMapping{ .{ .@"type" = "plain", .local = "", .remote = "" } };
 
 /// Validate an upstream origin URL: non-empty and a full `scheme://authority`
 /// URL. A malformed origin (e.g. "https:example.com", missing the "//") would
@@ -175,20 +187,37 @@ pub const Config = struct {
     verbose_upstream: bool = false,
 
     pub fn deinit(self: *Self) void {
+        // Release per-rule state (e.g. compiled regex engines) before reclaiming
+        // the arena. No-op for arena-built rules (their state lives in the
+        // arena), but keeps the deinit correct for non-arena allocators too.
+        for (self.upstream) |u| {
+            for (u.path) |p| {
+                if (p.deinit) |release| release(&p);
+            }
+        }
         self.arena.deinit();
     }
 
     /// Replace the upstream list with a single upstream at `host`, using the
     /// catch-all path rule (used by the `--upstream-host` override). The host
-    /// string is copied into the arena. Fails with `UpstreamHostConflict` if
-    /// the config already defines upstreams.
+    /// string and rule are copied/built into the arena. Fails with
+    /// `UpstreamHostConflict` if the config already defines upstreams.
     pub fn setUpstreamHost(self: *Self, host: []const u8) !void {
         try validateHost(host);
         if (self.upstream.len > 0) return ConfigError.UpstreamHostConflict;
         const a = self.arena.allocator();
         const dup = try a.dupe(u8, host);
+        // The catch-all rule maps any path to the upstream origin (root).
+        const path = try a.alloc(PathMapping, 1);
+        errdefer a.free(path);
+        path[0] = pathmap_mod.buildPathMapping(a, "plain", "", "") catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            pathmap_mod.Error.InvalidPathType => return ConfigError.InvalidPathType,
+            pathmap_mod.Error.InvalidRegex => return ConfigError.InvalidRegex,
+        };
         const list = try a.alloc(Upstream, 1);
-        list[0] = .{ .host = dup, .path = CatchAllPath[0..1] };
+        errdefer a.free(list);
+        list[0] = .{ .host = dup, .path = path };
         self.upstream = list;
     }
 
@@ -240,10 +269,51 @@ pub const Config = struct {
         cfg.timeout_ms = from_str.timeout_ms orelse from_file.timeout_ms orelse 900000;
         cfg.connect_timeout_ms = from_str.connect_timeout_ms orelse from_file.connect_timeout_ms orelse 10000;
         cfg.insecure = from_str.insecure orelse from_file.insecure orelse false;
-        cfg.upstream = from_str.upstream orelse from_file.upstream orelse &.{};
+
+        const raw_upstream = from_str.upstream orelse from_file.upstream orelse &.{};
+        cfg.upstream = try Self.buildUpstreams(ca, raw_upstream);
 
         try cfg.validate();
         return cfg;
+    }
+
+    /// Build the runtime upstream list from the decoded (raw) upstreams,
+    /// constructing each path rule via `pathmap.buildPathMapping` (which
+    /// compiles regex patterns and rejects unknown types).
+    fn buildUpstreams(allocator: std.mem.Allocator, raw: []const RawUpstream) ![]Upstream {
+        const list = try allocator.alloc(Upstream, raw.len);
+        errdefer allocator.free(list);
+        for (raw, list) |r, *u| {
+            const path = try Self.buildPaths(allocator, r.path);
+            errdefer allocator.free(path);
+            u.* = Upstream{
+                .host = r.host,
+                .interface = r.interface,
+                .connect_timeout_ms = r.connect_timeout_ms,
+                .timeout_ms = r.timeout_ms,
+                .insecure = r.insecure,
+                .protocol = r.protocol,
+                .request_headers = r.request_headers,
+                .response_headers = r.response_headers,
+                .path = path,
+            };
+        }
+        return list;
+    }
+
+    /// Build the runtime path rules from the decoded (raw) rules, mapping the
+    /// pathmap construction errors onto the config error set.
+    fn buildPaths(allocator: std.mem.Allocator, raw: []const RawPathMapping) ![]PathMapping {
+        const list = try allocator.alloc(PathMapping, raw.len);
+        errdefer allocator.free(list);
+        for (raw, list) |r, *u| {
+            u.* = pathmap_mod.buildPathMapping(allocator, r.@"type", r.local, r.remote) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                pathmap_mod.Error.InvalidPathType => return ConfigError.InvalidPathType,
+                pathmap_mod.Error.InvalidRegex => return ConfigError.InvalidRegex,
+            };
+        }
+        return list;
     }
 
     pub fn validate(self: *const Self) !void {
@@ -259,11 +329,6 @@ pub const Config = struct {
             try validateHost(u.host);
             if (u.effectiveTimeoutMs(self.timeout_ms) <= u.effectiveConnectTimeoutMs(self.connect_timeout_ms)) {
                 return ConfigError.ConnectTimeoutNotLessThanOverall;
-            }
-            for (u.path) |p| {
-                if (!std.mem.eql(u8, p.@"type", "plain")) return ConfigError.InvalidPathType;
-                // A blank local (like "/") matches any path, and a blank remote
-                // maps to the upstream origin root; both are valid.
             }
             const proto = u.protocol;
             if (!std.mem.eql(u8, proto, "http1") and

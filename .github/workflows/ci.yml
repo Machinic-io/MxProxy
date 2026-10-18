@@ -25,9 +25,10 @@ jobs:
     timeout-minutes: 10
     env:
       ZIG_VERSION: 0.17.0
-      # Pinned dep commits (both declare minimum_zig_version 0.17.0).
+      # Pinned dep commits (all declare minimum_zig_version 0.17.0).
       ZIG_CURL_REF: 9c0f1d211ad22dd0f4c20aa54060c1d9f163595a
       HTTPX_REF: deacfacea9a83c060d65ad65da1e40fa2edadc43
+      ZIG_REGEX_REF: fdd9c2e333ea6ac2fd06d080d939ef7f11d61b1b
       # Run the (Node 20) checkout/cache actions on Node 24 to silence the
       # runner deprecation warnings.
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -36,9 +37,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # build.zig.zon links zig-curl and httpx via local paths (../zig-curl and
-      # ../httpx.zig), so both must exist as siblings of the project checkout,
-      # pinned to the commits that build under Zig 0.17.
+      # build.zig.zon links zig-curl, httpx and zig-regex via local paths
+      # (../zig-curl, ../httpx.zig and ../zig-regex), so all three must exist as
+      # siblings of the project checkout, pinned to the commits that build under
+      # Zig 0.17.
       #
       # actions/checkout@v4 refuses to write outside GITHUB_WORKSPACE, so each
       # dep is checked out into ./deps/ first, then moved to its sibling slot.
@@ -56,12 +58,20 @@ jobs:
           ref: ${{ env.HTTPX_REF }}
           path: deps/httpx.zig
 
+      - name: Checkout zig-regex dependency
+        uses: actions/checkout@v4
+        with:
+          repository: zig-utils/zig-regex
+          ref: ${{ env.ZIG_REGEX_REF }}
+          path: deps/zig-regex
+
       - name: Move dependencies to sibling locations
         run: |
           set -euo pipefail
           deps_root="$(dirname "$GITHUB_WORKSPACE")"
           mv "$GITHUB_WORKSPACE/deps/zig-curl" "$deps_root/zig-curl"
           mv "$GITHUB_WORKSPACE/deps/httpx.zig" "$deps_root/httpx.zig"
+          mv "$GITHUB_WORKSPACE/deps/zig-regex" "$deps_root/zig-regex"
 
       # The build links against the system libcurl (link_vendor = false).
       - name: Install libcurl

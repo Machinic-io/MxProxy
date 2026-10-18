@@ -25,20 +25,40 @@ pub fn build(b: *std.Build) void {
     });
     const httpx_module = httpx_dep.module("httpx");
 
+    // regex — the regex engine behind the "regex" path-mapping type.
+    const regex_dep = b.dependency("regex", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const regex_module = regex_dep.module("regex");
+
+    // pathmap — the PathMapping interface + plain/regex implementations. Kept in
+    // its own module so config (which builds path mappings) and router (which
+    // dispatches them) can share it without an import cycle.
+    const mod_pathmap = b.addModule("pathmap", .{
+        .root_source_file = b.path("src/pathmap.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mod_pathmap.addImport("regex", regex_module);
+
     // config — configuration structs + JSON decoding/validation.
     const mod_config = b.addModule("config", .{
         .root_source_file = b.path("src/config.zig"),
         .target = target,
         .optimize = optimize,
     });
+    mod_config.addImport("pathmap", mod_pathmap);
 
-    // router — path matching/rewriting (plain now, extensible to regex).
+    // router — path matching/rewriting (plain + regex, dispatch via the
+    // PathMapping vtable).
     const mod_router = b.addModule("router", .{
         .root_source_file = b.path("src/router.zig"),
         .target = target,
         .optimize = optimize,
     });
     mod_router.addImport("config", mod_config);
+    mod_router.addImport("pathmap", mod_pathmap);
 
     // headers — hop-by-hop filtering + header override application.
     const mod_headers = b.addModule("headers", .{

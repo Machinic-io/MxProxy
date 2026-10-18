@@ -11,5 +11,8 @@
         .httpx = .{
             .path = "../httpx.zig",
         },
+        .regex = .{
+            .path = "../zig-regex",
+        },
     },
 }

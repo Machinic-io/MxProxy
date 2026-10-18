@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Pin this project to a Zig 0.17 toolchain and bootstrap the local path deps.
 #
-# The dependencies (httpx 0.2.2 and zig-curl) declare minimum_zig_version 0.17.0,
-# so the project only builds under Zig 0.17. Run `./zig build` instead of a bare
-# `zig build` to guarantee the right toolchain regardless of what `zig` resolves
-# to on the machine.
+# The dependencies (httpx 0.2.2, zig-curl and zig-regex) declare
+# minimum_zig_version 0.17.0, so the project only builds under Zig 0.17. Run
+# `./zig build` instead of a bare `zig build` to guarantee the right toolchain
+# regardless of what `zig` resolves to on the machine.
 #
-# build.zig.zon links zig-curl and httpx by sibling path (../zig-curl and
-# ../httpx.zig). If a sibling is missing it is cloned from GitHub at the pinned
-# commit, so a fresh checkout builds without manual setup. A present sibling
-# (one that has a build.zig.zon) is left untouched, so a local pin or edit
-# survives.
+# build.zig.zon links zig-curl, httpx and zig-regex by sibling path (../zig-curl,
+# ../httpx.zig and ../zig-regex). If a sibling is missing it is cloned from
+# GitHub at the pinned commit, so a fresh checkout builds without manual setup.
+# A present sibling (one that has a build.zig.zon) is left untouched, so a local
+# pin or edit survives.
 #
 # Toolchain resolution order:
 #   1. $ZIG_17 if set and it reports 0.17.x
@@ -27,8 +27,10 @@ DEPS_ROOT="$(dirname "$SCRIPT_DIR")"
 # same env names to point the bootstrap at a different commit.
 ZIG_CURL_REPO="https://github.com/jiacai2050/zig-curl"
 HTTPX_REPO="https://github.com/muhammad-fiaz/httpx.zig"
+ZIG_REGEX_REPO="https://github.com/zig-utils/zig-regex"
 ZIG_CURL_REF="${ZIG_CURL_REF:-9c0f1d211ad22dd0f4c20aa54060c1d9f163595a}"
 HTTPX_REF="${HTTPX_REF:-deacfacea9a83c060d65ad65da1e40fa2edadc43}"
+ZIG_REGEX_REF="${ZIG_REGEX_REF:-fdd9c2e333ea6ac2fd06d080d939ef7f11d61b1b}"
 
 # Ensure the sibling $1 is a checkout of $2 at $3; clone it if it is missing.
 # A sibling that already has a build.zig.zon is treated as present and kept.
@@ -47,6 +49,7 @@ ensure_dep() {
 
 ensure_dep zig-curl "$ZIG_CURL_REPO" "$ZIG_CURL_REF"
 ensure_dep httpx.zig "$HTTPX_REPO" "$HTTPX_REF"
+ensure_dep zig-regex "$ZIG_REGEX_REPO" "$ZIG_REGEX_REF"
 # --- End bootstrap ------------------------------------------------------------
 
 is17() {

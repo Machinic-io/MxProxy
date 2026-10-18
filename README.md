@@ -8,7 +8,7 @@ A fast, lightweight HTTP **reverse proxy** written in [Zig](https://ziglang.org)
 
 ## Highlights
 
-- **Multi-upstream routing** — strict-prefix path matching with first-match-wins, plus a catch-all passthrough for rule-less upstreams.
+- **Multi-upstream routing** — prefix or regex path rewriting with first-match-wins, plus a catch-all passthrough for rule-less upstreams.
 - **Header control** — set or delete headers in either direction (requests to the upstream, responses to the client).
 - **CORS out of the box** — swap `Access-Control-Allow-Origin` for a configured value (per-upstream override → CLI default → `*`), and rewrite `Origin` so the upstream sees a same-origin request.
 - **HTTP/1.1 + HTTP/2** — per-upstream protocol selection with an `auto` mode that negotiates HTTP/2 over TLS and transparently falls back to HTTP/1.1 when it is safe to do so.
@@ -25,8 +25,22 @@ A fast, lightweight HTTP **reverse proxy** written in [Zig](https://ziglang.org)
 flowchart TD
     A([Client request]) --> B[Accept loop<br/>one thread per connection]
     B --> C[Parse HTTP/1.1 request line + headers]
-    C --> D[Resolve upstream + rewrite path]
-    D --> E[Build request headers<br/>drop hop-by-hop, apply overrides + CORS]
+    C --> RESOLVE
+    subgraph RESOLVE ["Resolve upstream + rewrite path — router → pathmap"]
+        direction TB
+        P1["Iterate upstreams, then their path rules (first match wins)"]
+        P1 --> P2{"rule.rewrite matches the client path?"}
+        P2 -->|"plain: strict prefix"| P3["splice the client remainder<br/>under the remote prefix"]
+        P2 -->|"regex: full match"| P4["render the remote template<br/>with capture-group substitution"]
+        P3 --> P5["Route: upstream + rewritten,<br/>normalized upstream path"]
+        P4 --> P5
+        P2 -->|"no rule matches"| P6{"a rule-less upstream (catch-all) exists?"}
+        P6 -->|"yes"| P7["Route: path forwarded unchanged"]
+        P6 -->|"no route"| P8["404"]
+    end
+    P5 --> E[Build request headers<br/>drop hop-by-hop, apply overrides + CORS]
+    P7 --> E
+    P8 --> Z404([404 sent])
     E --> F{Request body?}
     F -->|none| G[no body]
     F -->|Content-Length| H[streamed, bounded]
@@ -52,7 +66,8 @@ The pipeline is split across a few focused modules:
 | --- | --- |
 | `src/main.zig` | CLI parsing, config load, startup, signals |
 | `src/config.zig` | Config structs, JSON decode + validation |
-| `src/router.zig` | Path matching + rewrite |
+| `src/router.zig` | Resolve upstream + rewrite path (first match wins, catch-all) |
+| `src/pathmap.zig` | Path rules: plain prefix + regex rewrite (the `PathMapping` vtable) |
 | `src/headers.zig` | Hop-by-hop filtering, header overrides, CORS |
 | `src/forward.zig` | Proxy core: parse request, drive libcurl |
 | `src/server.zig` | Accept loop, thread-per-connection, graceful shutdown |
@@ -196,10 +211,15 @@ Each rule rewrites the client path before forwarding:
 { "type": "plain", "local": "/api/", "remote": "/v1/" }
 ```
 
-- `type` is `"plain"` (a strict prefix match) — the only supported type today. It defaults to `"plain"` when omitted.
-- `local` is the client-facing prefix to strip. `""` or `"/"` matches any path.
-- `remote` is the upstream prefix to splice in. `""` or `"/"` maps to the upstream root.
-- The first matching rule wins (upstream order, then rule order). If no rule matches, the first upstream with no `path` rules forwards the path unchanged.
+- `type` is `"plain"` (a strict prefix match) or `"regex"` (a full-match pattern rewrite). It defaults to `"plain"` when omitted.
+- **`plain`** — `local` is the client-facing prefix to strip (`""` or `"/"` matches any path); `remote` is the upstream prefix to splice in (`""` or `"/"` maps to the upstream root). The client remainder is spliced under `remote` into a clean absolute path.
+- **`regex`** — `local` is a regular expression that must match the **entire** client path (a partial match is a non-match); it is compiled once at config load, so a malformed pattern is rejected at startup. `remote` is an upstream template that may reference capture groups — `$0` is the whole match, `$1`/`$2`/… are the groups. The rendered template is normalized to a clean absolute path.
+
+```json
+{ "type": "regex", "local": "/api/product/([0-9]+)/info", "remote": "/api/product/info/$1" }
+```
+
+- The first matching rule wins (upstream order, then rule order). If no rule matches, the first upstream with no `path` rules forwards the path unchanged; if there is none, the request 404s.
 
 #### Header overrides
 
@@ -231,7 +251,8 @@ The suite covers config parsing/validation, routing, header handling, and end-to
 ```
 src/main.zig        entry point: CLI, config, signals
 src/config.zig      config structs + JSON decode/validation
-src/router.zig      path matching + rewrite
+src/router.zig      resolve upstream + rewrite path (first match wins, catch-all)
+src/pathmap.zig     path rules (plain prefix + regex), the PathMapping vtable
 src/headers.zig     hop-by-hop filtering + header overrides + CORS
 src/forward.zig     proxy core: parse request, drive libcurl
 src/server.zig      accept loop + thread-per-connection + shutdown

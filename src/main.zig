@@ -38,6 +38,30 @@ fn valueAfter(arg: []const u8) []const u8 {
     return "";
 }
 
+/// A user-actionable explanation for the config errors the proxy can raise at
+/// startup. Returns null for errors without a dedicated sentence (e.g. OOM or a
+/// malformed-JSON parse error), whose bare name is still informative.
+fn configErrorDetail(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        config_mod.ConfigError.InvalidPort => "port must be non-zero",
+        config_mod.ConfigError.MissingHost => "an upstream is missing its host",
+        config_mod.ConfigError.InvalidHost => "an upstream host is not a full 'scheme://authority' URL (missing '://')",
+        config_mod.ConfigError.InvalidPathType => "a path rule uses an unsupported type (supported: plain, regex)",
+        config_mod.ConfigError.InvalidRegex => "a path rule's 'local' is not a valid regular expression",
+        config_mod.ConfigError.InvalidProtocol => "an upstream protocol must be 'http1', 'http2', or 'auto'",
+        config_mod.ConfigError.UpstreamHostConflict => "--upstream-host conflicts with upstreams already configured",
+        config_mod.ConfigError.ConfigFileNotFound => "config file not found",
+        config_mod.ConfigError.InvalidConfig => "invalid config",
+        config_mod.ConfigError.ConnectTimeoutNotLessThanOverall => "overall timeout must be greater than the connect timeout",
+        else => null,
+    };
+}
+
+fn logConfigError(err: anyerror) void {
+    if (configErrorDetail(err)) |detail| log.err("config error: {s}", .{detail})
+    else log.err("config error: {any}", .{err});
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     // The page allocator frees individual allocations (unlike the process
@@ -104,7 +128,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const config = config_mod.Config.load(io, allocator, config_file, config_json) catch |err| {
-        log.err("config error: {any}", .{ err });
+        logConfigError(err);
         return err;
     };
 
@@ -116,7 +140,7 @@ pub fn main(init: std.process.Init) !void {
     if (insecure_override) config.insecure = true;
     if (upstream_host_override) |h| {
         config.setUpstreamHost(h) catch |err| {
-            log.err("config error: {any}", .{ err });
+            logConfigError(err);
             return err;
         };
     }
