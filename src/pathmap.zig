@@ -52,7 +52,10 @@ pub const PathMapping = struct {
     /// expression for "regex".
     local: []const u8,
     /// The upstream path the matched client path maps to. For "regex" this may
-    /// reference capture groups with `$1`, `$2`, ... (`$0` is the whole match).
+    /// reference the match and capture groups: `$0`/`${0}` is the whole match,
+    /// `$1`..`$9`/`${1}`..`${999}` are the capture groups, and `\$` is a
+    /// literal `$`. A `$` not followed by a digit or `{`, or a reference to a
+    /// group that does not exist, is emitted literally.
     remote: []const u8,
 
     /// Rewrite an incoming client path (`ctx.path`) to the upstream path.
@@ -219,18 +222,72 @@ fn splicedPath(allocator: std.mem.Allocator, remote_prefix: []const u8, rest: []
     return allocator.print("{s}/{s}", .{ b, r });
 }
 
-/// Render a `remote` template against a match, substituting `$0` (the whole
-/// match) and `$1`/`$2`/... (capture groups, `captures[n-1]`). A `$` not
-/// followed by a digit, or a reference to a group that does not exist, is
-/// emitted literally. The returned slice is allocated from `allocator`.
+/// Parse a braced `${N}` reference at `template[i]` (where `template[i] ==
+/// '$'` and `template[i+1] == '{'`). `N` is up to 3 digits (0..=999): 0 is
+/// the whole match, 1..=999 is capture group N (`captures[N-1]`). On
+/// success, appends the referenced text to `out` and returns the index just
+/// past the closing `}`. Returns null when the sequence is not a valid
+/// reference (malformed, more than 3 digits, or a group that does not
+/// exist); the caller then emits the `$` and rescans, which reproduces the
+/// literal sequence either way.
+fn bracedRef(out: *std.array_list.Managed(u8), template: []const u8, i: usize, match: regex_mod.Match) RewriteError!?usize {
+    var n: usize = 0;
+    var digits: usize = 0;
+    var j = i + 2;
+    while (digits < 3 and j < template.len) : (j += 1) {
+        const d = template[j];
+        if (d < '0' or d > '9') break;
+        n = n * 10 + (d - '0');
+        digits += 1;
+    }
+    if (digits == 0 or j >= template.len or template[j] != '}') return null;
+    if (n == 0) {
+        try out.appendSlice(match.slice);
+    } else if (n - 1 < match.captures.len) {
+        try out.appendSlice(match.captures[n - 1]);
+    } else {
+        return null; // reference to a group that does not exist
+    }
+    return j + 1;
+}
+
+/// Render a `remote` template against a match, substituting references to the
+/// match and capture groups:
+/// - `$0` and `${0}` — the whole match
+/// - `$1`..`$9` and `${1}`..`${999}` — capture groups (`captures[n-1]`)
+/// - `\$` — a literal `$` (a backslash before anything else is a literal
+///   backslash; there are no other escapes)
+/// A `$` not followed by a digit or `{`, or a reference to a group that does
+/// not exist (or outside 0..=999), is emitted literally. The returned slice
+/// is allocated from `allocator`.
 fn applyReplacement(allocator: std.mem.Allocator, template: []const u8, match: regex_mod.Match) RewriteError![]u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var i: usize = 0;
     while (i < template.len) : (i += 1) {
         const c = template[i];
+        if (c == '\\') {
+            // `\$` is a literal dollar; any other backslash passes through.
+            if (i + 1 < template.len and template[i + 1] == '$') {
+                try out.append('$');
+                i += 1; // consume the '$' (the loop increment skips the '\\')
+                continue;
+            }
+            try out.append(c);
+            continue;
+        }
         if (c == '$' and i + 1 < template.len) {
             const d = template[i + 1];
+            if (d == '{') {
+                // Braced `${N}` reference (N is 0..=999). When the sequence
+                // is not a valid reference, emit the '$' and rescan.
+                if (try bracedRef(&out, template, i, match)) |end| {
+                    i = end - 1; // the loop increment lands on `end`
+                    continue;
+                }
+                try out.append('$');
+                continue;
+            }
             if (d >= '0' and d <= '9') {
                 const n = d - '0';
                 if (n == 0) {

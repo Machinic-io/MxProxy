@@ -142,6 +142,25 @@ pub fn build(b: *std.Build) void {
         .root_module = test_module,
     });
     const run_tests = b.addRunArtifact(tests);
+
+    // Router unit tests: a separate root exercising the router and the
+    // path-rewrite (replacement) logic directly — no config load, no network.
+    const router_test_module = b.addModule("router_test", .{
+        .root_source_file = b.path("test/router_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    router_test_module.addImport("config", mod_config);
+    router_test_module.addImport("pathmap", mod_pathmap);
+    router_test_module.addImport("router", mod_router);
+
+    const router_tests = b.addTest(.{
+        .name = "router_test",
+        .root_module = router_test_module,
+    });
+    const run_router_tests = b.addRunArtifact(router_tests);
+
     const test_step = b.step("test", "Run proxy tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_router_tests.step);
 }

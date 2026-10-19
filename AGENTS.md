@@ -61,8 +61,10 @@ Confirmed against the 0.17 toolchain. Avoid these (they do not compile):
 ## Commands
 
 - `./zig build` — build the `MxProxy` executable.
-- `./zig build test` — compile and run all tests (config unit tests +
-  integration tests live in `test/proxy_test.zig`).
+- `./zig build test` — compile and run all tests (config unit + integration
+  tests live in `test/proxy_test.zig`; router/rewrite unit tests in
+  `test/router_test.zig`). Both are separate test roots wired to the `test`
+  step in `build.zig`.
 - `./zig build run -- <args>` — run the proxy with args (e.g. `--port=8080`).
 
 ## Layout
@@ -73,4 +75,7 @@ Confirmed against the 0.17 toolchain. Avoid these (they do not compile):
 - `src/forward.zig` — the proxy core (parse request, drive libcurl directly).
 - `src/server.zig` — accept loop, thread-per-connection, shutdown.
 - `src/headers.zig` — hop-by-hop filtering + header override application.
-- `test/proxy_test.zig` — all tests (single test root, matching old MxProxy).
+- `test/proxy_test.zig` — config unit tests + in-process integration tests.
+- `test/router_test.zig` — router/rewrite unit tests (path-rewrite +
+  `${N}`/`\$` replacement syntax). Both are separate test roots wired to the
+  `test` step in `build.zig`.

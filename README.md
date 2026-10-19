@@ -226,7 +226,7 @@ Each rule rewrites the client path before forwarding:
 
 - `type` is `"plain"` (a strict prefix match) or `"regex"` (a full-match pattern rewrite). It defaults to `"plain"` when omitted.
 - **`plain`** — `local` is the client-facing prefix to strip (`""` or `"/"` matches any path); `remote` is the upstream prefix to splice in (`""` or `"/"` maps to the upstream root). The client remainder is spliced under `remote` into a clean absolute path.
-- **`regex`** — `local` is a regular expression that must match the **entire** client path (a partial match is a non-match); it is compiled once at config load, so a malformed pattern is rejected at startup. `remote` is an upstream template that may reference capture groups — `$0` is the whole match, `$1`/`$2`/… are the groups (single-digit group numbers; a `$` not followed by a digit, or pointing at a group that does not exist, is emitted literally). The rendered template is normalized to a clean absolute path.
+- **`regex`** — `local` is a regular expression that must match the **entire** client path (a partial match is a non-match); it is compiled once at config load, so a malformed pattern is rejected at startup. `remote` is an upstream template that may reference the match and capture groups — `$0`/`${0}` is the whole match, `$1`/`$2`/… are single-digit groups, and `${1}`/…/`${999}` reference the groups beyond the ninth; `\$` is a literal `$`. A `$` not followed by a digit or `{`, or pointing at a group that does not exist (or outside 0–999), is emitted literally. The rendered template is normalized to a clean absolute path.
 
 ```json
 { "type": "regex", "local": "/api/product/([0-9]+)/info", "remote": "/api/product/info/$1" }
