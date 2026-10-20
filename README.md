@@ -124,7 +124,7 @@ MxProxy is configured by a JSON config file, an inline JSON string, and/or comma
 Forward everything to a single upstream:
 
 ```sh
-./zig-out/bin/MxProxy --upstream-host=https://example.com --port=8080
+./zig-out/bin/MxProxy --port=8080 --upstream-host=https://example.com
 ```
 
 Or from a config file:
