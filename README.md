@@ -113,6 +113,26 @@ Prefer to call `zig` directly? Point the wrapper at your 0.17 toolchain:
 ZIG_17=/path/to/zig-0.17 ./zig build
 ```
 
+Cross-compiling for another platform? Pass `-Dtarget=` together with
+`-Dlink_vendor=true`:
+
+```sh
+./zig build -Dtarget=x86_64-linux -Dlink_vendor=true
+```
+
+`-Dlink_vendor=true` builds the vendored libcurl (libcurl + mbedtls + zlib,
+compiled from source by `zig cc`) instead of linking the system libcurl, which
+is what lets every target build from a single machine. Local builds keep the
+system libcurl by default. The [release workflow](./.github/workflows/release.yml)
+publishes three artifacts: `x86_64-linux` (runner's system libcurl — keeps
+HTTP/2, dynamically linked against glibc/libcurl/OpenSSL),
+`x86_64-linux-vendored` (vendored, fully static), and
+`aarch64-macos-vendored` (vendored, cross-compiled). Note that the vendored
+libcurl has **no HTTP/2** (no nghttp2): in the two `-vendored` artifacts,
+`"auto"` protocol runs over HTTP/1.1 (detected at startup) and an explicit
+`"http2"` protocol is rejected with a startup error. All release binaries
+are stripped.
+
 ## Running
 
 MxProxy is configured by a JSON config file, an inline JSON string, and/or command-line flags. Precedence (lowest → highest):
@@ -249,7 +269,7 @@ Two headers get special treatment:
 
 ### `auto` protocol mode
 
-With `"protocol": "auto"`, MxProxy tries HTTP/2 over TLS first. If the upstream transfer fails **before any bytes reach the client** and the request body is re-sendable, it transparently retries over HTTP/1.1 — the client sees a single response, but the failed first attempt is logged at info level. (A streaming request body that is consumed on the first attempt disables this fallback.)
+With `"protocol": "auto"`, MxProxy tries HTTP/2 over TLS first (when the linked libcurl supports HTTP/2 — the vendored release build does not, so `"auto"` goes straight to HTTP/1.1 there). If the upstream transfer fails **before any bytes reach the client** and the request body is re-sendable, it transparently retries over HTTP/1.1 — the client sees a single response, but the failed first attempt is logged at info level. (A streaming request body that is consumed on the first attempt disables this fallback.)
 
 ### Error attribution
 

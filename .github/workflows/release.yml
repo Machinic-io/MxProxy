@@ -1,0 +1,218 @@
+# Publishes a release: when a GitHub Release is created (tag pushed and
+# published), this workflow builds MxProxy for every supported platform and
+# attaches the binaries to that release.
+#
+# All targets build on a single Linux runner (macOS via zig cc's
+# cross-compilation). Artifact names ending in `-vendored` link the
+# *vendored* libcurl (-Dlink_vendor=true: zig-curl compiles libcurl +
+# mbedtls + zlib from source) because the system libcurl cannot be
+# cross-linked; the plain `x86_64-linux` artifact links the runner's system
+# libcurl instead, so it keeps HTTP/2 (nghttp2) and is dynamically linked
+# against glibc/libcurl/OpenSSL. The vendored builds have no nghttp2, so
+# there "auto" protocol runs over HTTP/1.1 (detected at startup via
+# curl_version_info) and explicit "http2" is refused. All release binaries
+# are stripped (see build.zig).
+#
+# The sibling dependency checkouts (zig-curl, httpx.zig, zig-regex) are
+# bootstrapped by the repo's ./zig wrapper at the pinned refs below, so no
+# manual checkout steps are needed.
+name: Release
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+# A newer release for the same tag cancels the in-flight one.
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: 0.17.0
+  # Pinned dep commits (all declare minimum_zig_version 0.17.0); must match
+  # ci.yml. The ./zig wrapper clones any missing sibling at these refs.
+  ZIG_CURL_REF: 9c0f1d211ad22dd0f4c20aa54060c1d9f163595a
+  HTTPX_REF: deacfacea9a83c060d65ad65da1e40fa2edadc43
+  ZIG_REGEX_REF: fdd9c2e333ea6ac2fd06d080d939ef7f11d61b1b
+  # Run the (Node 20) checkout/cache actions on Node 24 to silence the
+  # runner deprecation warnings.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  # Gate: only publish binaries from a commit that passes the native suite
+  # (config, router, headers + integration) against BOTH libcurl link modes:
+  # the system libcurl (the dev workflow) and the vendored one (-Dlink_vendor
+  # = true), which is what the release binaries actually link. The vendored
+  # run matters: e.g. its lack of nghttp2 used to make "auto" 502 every
+  # bodied request, which the system-libcurl suite never caught.
+  test:
+    name: Test (native)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # The build links against the system libcurl (link_vendor = false).
+      - name: Install libcurl
+        run: sudo apt-get install -y libcurl4-openssl-dev
+
+      # URL deps (zstd, brotli, env, ...) are extracted into zig-pkg/. Keyed
+      # on the .zon so a dep bump refetches; otherwise the ~87MB isn't
+      # re-downloaded.
+      - name: Cache Zig package cache
+        uses: actions/cache@v4
+        with:
+          path: zig-pkg
+          key: zigpkg-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon') }}
+          save-always: true
+
+      - name: Build
+        run: ./zig build
+
+      - name: Test
+        run: ./zig build test
+
+      # The release binaries link the vendored libcurl; gate on that exact
+      # configuration too (it exercises the same suite in-process).
+      - name: Build (vendored libcurl)
+        run: ./zig build -Dlink_vendor=true
+
+      - name: Test (vendored libcurl)
+        run: ./zig build test -Dlink_vendor=true
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # (No Windows target: the proxy's signal handling and arg parsing
+          # are POSIX-only, so it does not build for x86_64-windows.)
+          # x86_64-linux is published twice: the plain name links the
+          # runner's system libcurl (keeps HTTP/2), the `-vendored` name the
+          # fully static self-contained build. No x86_64-macos: aarch64
+          # (Apple Silicon) is the macOS target we ship.
+          - name: x86_64-linux
+            target: x86_64-linux
+            link_vendor: false
+          - name: x86_64-linux-vendored
+            target: x86_64-linux
+            link_vendor: true
+          - name: aarch64-macos-vendored
+            target: aarch64-macos
+            link_vendor: true
+    env:
+      # Per-target caches so a matrix restore never pulls another target's.
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-${{ matrix.name }}
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-${{ matrix.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Cache Zig caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            zig-pkg
+            ${{ env.ZIG_GLOBAL_CACHE_DIR }}
+          key: zig-${{ matrix.name }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'zig') }}
+          restore-keys: zig-${{ matrix.name }}-${{ env.ZIG_VERSION }}-
+
+      # Needed by the plain x86_64-linux artifact (system libcurl); the
+      # vendored builds compile their own and ignore this.
+      - name: Install libcurl
+        run: sudo apt-get install -y libcurl4-openssl-dev
+
+      - name: Build
+        # The vendored artifacts pass -Dtarget (required for the macOS
+        # cross-compile). The plain x86_64-linux artifact links the runner's
+        # system libcurl and passes NO -Dtarget: the native default target
+        # carries the runner's glibc version, while a bare
+        # -Dtarget=x86_64-linux leaves zig 0.17's system-library search
+        # paths empty, so the translate-c step cannot find libcurl.
+        run: |
+          if [ "${{ matrix.link_vendor }}" = "true" ]; then
+            ./zig build -Dtarget=${{ matrix.target }} -Dlink_vendor=true
+          else
+            ./zig build -Dlink_vendor=false
+          fi
+
+      # The Linux targets are the only ones this runner can execute, so
+      # smoke test those artifacts: --help, plus a GET and a bodied POST
+      # round trip (the POST is the case the vendored libcurl used to 502).
+      - name: Smoke test (Linux)
+        if: matrix.name == 'x86_64-linux' || matrix.name == 'x86_64-linux-vendored'
+        run: |
+          set -euo pipefail
+          bin="zig-out/bin/MxProxy"
+          # --help prints usage to stderr (std.debug.print) and exits 0.
+          "$bin" --help > /dev/null 2>&1
+
+          cat > upstream.py <<'EOF'
+          import http.server
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  body = b"smoke-ok"
+                  self.send_response(200)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def do_POST(self):
+                  n = int(self.headers.get("Content-Length", 0))
+                  data = self.rfile.read(n)
+                  body = b"echo:" + data
+                  self.send_response(201)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, *a): pass
+          http.server.HTTPServer(("127.0.0.1", 18090), H).serve_forever()
+          EOF
+          python3 upstream.py & upstream_pid=$!
+          "$bin" --upstream-host=http://127.0.0.1:18090 --port=18091 --silent & proxy_pid=$!
+          sleep 1
+          get_out=$(curl -sf --max-time 5 http://127.0.0.1:18091/hello)
+          post_out=$(curl -sf --max-time 5 -X POST --data smoke-payload http://127.0.0.1:18091/echo)
+          kill "$upstream_pid" "$proxy_pid" 2> /dev/null || true
+          [ "$get_out" = "smoke-ok" ]
+          [ "$post_out" = "echo:smoke-payload" ]
+          echo "smoke test passed"
+
+      - name: Package
+        env:
+          VERSION: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version="${VERSION}"
+          # Tags may carry a leading "v" (v0.1.0); strip it so both tag
+          # styles name the same artifact.
+          version="${version#v}"
+          if [ -z "${version}" ]; then version="manual"; fi
+          name="MxProxy-${version}-${{ matrix.name }}.tar.gz"
+          tar czf "${GITHUB_WORKSPACE}/${name}" -C zig-out/bin MxProxy
+          echo "artifact=${name}" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ env.artifact }}
+          fail_on_unmatched_files: true

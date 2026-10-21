@@ -55,15 +55,34 @@ verbose: bool,
 /// process-wide (see the log function in main.zig), and the per-request line
 /// in forward() is skipped.
 silent: bool,
+/// Whether the linked libcurl build has HTTP/2 (nghttp2). The vendored
+/// release build does not: there, requesting CURL_HTTP_VERSION_2TLS ("auto")
+/// is rejected with CURLE_NOT_BUILT_IN, so "auto" must map straight to
+/// HTTP/1.1 (see firstProtocol) and explicit "http2" is refused at startup.
+http2: bool,
 
 pub const Forwarder = Self;
 
 pub fn init(config: *const config_mod.Config, verbose: bool, silent: bool) !Self {
+    // Detect HTTP/2 support from the linked libcurl rather than assuming it:
+    // a build without nghttp2 rejects CURL_HTTP_VERSION_2TLS/2_0 setopts, and
+    // because a bodied request cannot fall back, that would 502 every upload.
+    const vinfo = curl.libcurl.curl_version_info(@as(c_uint, curl.libcurl.CURLVERSION_NOW));
+    const has_http2 = vinfo[0].nghttp2_version != null;
+    if (!has_http2) {
+        for (config.upstream) |u| {
+            if (std.mem.eql(u8, u.protocol, "http2")) {
+                log.err("upstream {s}: protocol \"http2\" is not supported by this libcurl build (no nghttp2)", .{u.host});
+                return error.Http2NotSupported;
+            }
+        }
+    }
     return .{
         .config = config,
         .router = router_mod.Router.init(config.upstream),
         .verbose = verbose,
         .silent = silent,
+        .http2 = has_http2,
     };
 }
 
@@ -433,7 +452,7 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
         const http_version: curl.Easy.HttpVersion = if (use_fallback)
             .http1_1
         else
-            firstProtocol(upstream.protocol);
+            firstProtocol(self.http2, upstream.protocol);
         self.attempt(allocator, &ctx, url_z, upstream, req_headers, method_z, http_version) catch |err| {
             if (can_fallback and !ctx.head_done and !use_fallback and ctx.client_fault == null) {
                 // Nothing reached the client; retry the same request over
@@ -492,6 +511,16 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
     if (!self.silent) log.info("{s:<4} {s:<32} -> {s:<32} {d} ({d}us)", .{ method, path, remote_path, ctx.response_status, elapsedUs(start, socket.io) });
 }
 
+/// Set an option on the easy handle. On failure the libcurl reason is recorded
+/// in `ctx` so the caller's log shows a real reason (e.g. "A required libcurl
+/// or SSL feature is missing") instead of "unknown libcurl error".
+fn setOpt(ctx: *Ctx, code: curl.libcurl.CURLcode, diag: *curl.Diagnostics) !void {
+    curl.checkCode(code, diag) catch {
+        ctx.curl_error = diag.getMessage();
+        return error.Curl;
+    };
+}
+
 /// Configure a fresh easy handle and run one transfer attempt at `http_version`.
 /// The response head (when received) is written to the client by the header
 /// callback; the caller inspects `ctx.head_done` to decide whether a retry is
@@ -515,51 +544,51 @@ fn attempt(
     const curl_handle = curl.libcurl.curl_easy_init() orelse return error.Curl;
     defer curl.libcurl.curl_easy_cleanup(curl_handle);
     var diag: curl.Diagnostics = .{};
-    try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_URL, url_z.ptr), &diag);
-    try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_HTTP_VERSION, @backingInt(http_version)), &diag);
-    try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_FOLLOWLOCATION, @as(c_long, 0)), &diag);
+    try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_URL, url_z.ptr), &diag);
+    try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_HTTP_VERSION, @backingInt(http_version)), &diag);
+    try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_FOLLOWLOCATION, @as(c_long, 0)), &diag);
     if (self.config.verbose_upstream) {
-        try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_VERBOSE, @as(c_long, 1)), &diag);
+        try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_VERBOSE, @as(c_long, 1)), &diag);
     }
-    try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_CONNECTTIMEOUT_MS, upstream.effectiveConnectTimeoutMs(self.config.connect_timeout_ms)), &diag);
-    try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_TIMEOUT_MS, upstream.effectiveTimeoutMs(self.config.timeout_ms)), &diag);
+    try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_CONNECTTIMEOUT_MS, upstream.effectiveConnectTimeoutMs(self.config.connect_timeout_ms)), &diag);
+    try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_TIMEOUT_MS, upstream.effectiveTimeoutMs(self.config.timeout_ms)), &diag);
     const user_agent = [_]u8{ 'M', 'x', 'P', 'r', 'o', 'x', 'y', 0 };
-    try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_USERAGENT, &user_agent[0]), &diag);
+    try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_USERAGENT, &user_agent[0]), &diag);
     // We deliberately do NOT set CURLOPT_ACCEPT_ENCODING. Setting it to ANY
     // value (even "identity") turns on libcurl's automatic content decoding,
     // which decompresses the body out from under the Content-Encoding header.
     // Leaving it unset keeps the relayed body byte-for-byte what upstream sent.
     if (upstream.effectiveInsecure(self.config.insecure)) {
-        try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_SSL_VERIFYPEER, @as(c_long, 0)), &diag);
-        try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_SSL_VERIFYHOST, @as(c_long, 0)), &diag);
+        try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_SSL_VERIFYPEER, @as(c_long, 0)), &diag);
+        try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_SSL_VERIFYHOST, @as(c_long, 0)), &diag);
     }
-    try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_CUSTOMREQUEST, method_z.ptr), &diag);
+    try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_CUSTOMREQUEST, method_z.ptr), &diag);
     if (upstream.effectiveInterface(self.config.interface)) |iface| {
         const iface_z = try allocator.printSentinel("{s}", .{iface}, 0);
         defer allocator.free(iface_z);
-        try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_INTERFACE, iface_z.ptr), &diag);
+        try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_INTERFACE, iface_z.ptr), &diag);
     }
     var slist: ?*curl.libcurl.struct_curl_slist = null;
     defer if (slist) |s| curl.libcurl.curl_slist_free_all(s);
     for (req_headers) |h| {
         slist = curl.libcurl.curl_slist_append(slist, h.ptr) orelse return error.Curl;
     }
-    if (slist) |s| try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_HTTPHEADER, s), &diag);
+    if (slist) |s| try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_HTTPHEADER, s), &diag);
     if (ctx.body_mode != .none) {
-        try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_UPLOAD, @as(c_long, 1)), &diag);
+        try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_UPLOAD, @as(c_long, 1)), &diag);
         // A .socket body has a known size (declared Content-Length); a .chunked
         // body does not, so we omit INFILESIZE and let libcurl re-frame the
         // upload as chunked (HTTP/1.1) / unframed (HTTP/2).
         if (ctx.body_mode == .socket) {
-            try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_INFILESIZE_LARGE, @as(c_long, @intCast(ctx.body_remaining))), &diag);
+            try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_INFILESIZE_LARGE, @as(c_long, @intCast(ctx.body_remaining))), &diag);
         }
-        try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_READFUNCTION, readCallback), &diag);
-        try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_READDATA, ctx), &diag);
+        try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_READFUNCTION, readCallback), &diag);
+        try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_READDATA, ctx), &diag);
     }
-    try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_WRITEFUNCTION, writeCallback), &diag);
-    try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_WRITEDATA, ctx), &diag);
-    try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_HEADERFUNCTION, headerCallback), &diag);
-    try curl.checkCode(curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_HEADERDATA, ctx), &diag);
+    try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_WRITEFUNCTION, writeCallback), &diag);
+    try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_WRITEDATA, ctx), &diag);
+    try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_HEADERFUNCTION, headerCallback), &diag);
+    try setOpt(ctx, curl.libcurl.curl_easy_setopt(curl_handle, curl.libcurl.CURLOPT_HEADERDATA, ctx), &diag);
     curl.checkCode(curl.libcurl.curl_easy_perform(curl_handle), &diag) catch |err| {
         // Remember the libcurl reason so forward() can log an actionable error.
         ctx.curl_error = diag.getMessage();
@@ -583,11 +612,15 @@ fn attempt(
     };
 }
 
-/// The first protocol to try for an upstream's `protocol` setting.
-fn firstProtocol(protocol: []const u8) curl.Easy.HttpVersion {
+/// The first protocol to try for an upstream's `protocol` setting. "auto"
+/// prefers HTTP/2 over TLS only when the linked libcurl supports it: the
+/// vendored release build lacks nghttp2, and there CURL_HTTP_VERSION_2TLS is
+/// rejected with CURLE_NOT_BUILT_IN (which a bodied request cannot recover
+/// from), so "auto" goes straight to HTTP/1.1 instead.
+fn firstProtocol(has_http2: bool, protocol: []const u8) curl.Easy.HttpVersion {
     if (std.mem.eql(u8, protocol, "http1")) return .http1_1;
     if (std.mem.eql(u8, protocol, "http2")) return .http2;
-    return .http2_tls; // "auto" (default): HTTP/2 over TLS, HTTP/1.1 cleartext.
+    return if (has_http2) .http2_tls else .http1_1; // "auto" (default)
 }
 
 /// Reset the per-attempt state so an HTTP/1.1 fallback re-runs the transfer

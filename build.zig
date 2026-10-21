@@ -11,11 +11,26 @@ pub fn build(b: *std.Build) void {
     else
         std.builtin.Optimize.debug;
 
-    // curl — link against the system libcurl rather than vendoring it.
+    // Release builds strip the binary. The 0.17 ELF linker embeds full DWARF
+    // in release artifacts by default (the unstripped x86_64-linux release
+    // binary is ~15MB, ~12MB of it .debug_* sections); stripping brings it to
+    // ~2.3MB. Debug builds keep their debug info.
+    const strip = optimize != .debug;
+
+    // curl — link against the system libcurl by default. Pass
+    // -Dlink_vendor=true to build the vendored libcurl (zig-curl compiles
+    // libcurl + mbedtls + zlib from source with zig cc) instead; that is
+    // what the release workflow uses, so every target can be cross-compiled
+    // from a single Linux runner without target libcurl headers.
+    const link_vendor = b.option(
+        bool,
+        "link_vendor",
+        "link the vendored libcurl (with its own TLS) instead of the system libcurl",
+    ) orelse false;
     const curl_dep = b.dependency("curl", .{
         .target = target,
         .optimize = optimize,
-        .link_vendor = false,
+        .link_vendor = link_vendor,
     });
     const curl_module = curl_dep.module("curl");
 
@@ -101,6 +116,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .strip = strip,
     });
     main_module.addImport("config", mod_config);
     main_module.addImport("router", mod_router);

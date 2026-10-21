@@ -44,6 +44,13 @@ Confirmed against the 0.17 toolchain. Avoid these (they do not compile):
   - delete: `std.Io.Dir.cwd().deleteFile(io, path)`
 - **`b.args` is gone from `std.Build`.** To forward CLI args to a run artifact,
   call `run_cmd.addPassthruArgs()` (no `if (b.args)`).
+- **A bare `-Dtarget=x86_64-linux` (no libc version) leaves the
+  system-library search paths empty.** Linking a system lib then fails with
+  `unable to find dynamic system library "curl" ... searched paths: none`
+  (in zig-curl's translate-c step). For native builds that link system
+  libraries, omit `-Dtarget` so the host default target is used — it carries
+  the glibc version (e.g. `x86_64-linux.7.0...7.0-gnu.2.39`). Cross targets
+  and vendored builds are unaffected (they link no system libraries).
 - **`std.builtin.Optimize` fields are lowercase** (`debug`, `safe`, `fast`,
   `small`). The old `.ReleaseFast`/`.Debug` are deprecated comptime aliases that
   do NOT resolve in `==` comparisons or leading-dot positions — use `.fast` and
@@ -57,6 +64,31 @@ Confirmed against the 0.17 toolchain. Avoid these (they do not compile):
   therefore drives the raw bindings directly via `curl.libcurl` (`curl_easy_*`,
   `curl_slist_*`) and `curl.checkCode` + a local `curl.Diagnostics{}`. The
   `Easy` type is still used only for its `HttpVersion` enum.
+- **The vendored libcurl has no HTTP/2.** `link_vendor=true` (zig-curl) compiles
+  libcurl + mbedtls + zlib but not nghttp2, so it is built without `USE_HTTP2`.
+  There, `setopt(CURLOPT_HTTP_VERSION, 2TLS/2_0)` fails with `CURLE_NOT_BUILT_IN`.
+  `forward.zig` detects this at startup via `curl_version_info` (`nghttp2_version
+  != null`): when absent, `"auto"` maps straight to HTTP/1.1 and an explicit
+  `"http2"` protocol is refused at startup. This is why the release (vendored)
+  binaries are HTTP/1.1-only upstream while dev/system-libcurl builds can do
+  HTTP/2. Do not "fix" this by assuming `auto` always requests 2TLS.
+
+## Release / binary size
+
+- Release artifacts are built on a single Linux runner and **stripped** (see
+  `strip` in `build.zig`); a `-vendored` suffix marks the artifacts that link
+  the vendored libcurl. `x86_64-linux` (runner's system libcurl — keeps
+  HTTP/2, dynamic glibc/libcurl/OpenSSL deps), `x86_64-linux-vendored`
+  (vendored libcurl, fully static), `aarch64-macos-vendored` (vendored,
+  cross-compiled; no x86_64-macos target). Zig 0.17's ELF linker embeds full
+  DWARF in release
+  artifacts by default, so an unstripped x86_64-linux release binary is ~15MB
+  (~12MB of `.debug_*`); stripping brings it to ~2.3MB. The macOS Mach-O
+  target does not embed DWARF (it was already ~2.5MB unstripped).
+- The release gate runs the native test suite against **both** the system and
+  the vendored libcurl, because the two link different libcurl feature sets
+  (the vendored one lacks HTTP/2) and the system-only suite used to miss the
+  resulting 502-on-bodied-request bug.
 
 ## Commands
 
