@@ -1,12 +1,15 @@
 # AGENTS.md
 
-## Toolchain: build with Zig 0.17
+## Toolchain: build with Zig 0.17.1
 
-The dependencies (`httpx` 0.2.2 and `zig-curl`) both declare
-`minimum_zig_version = "0.17.0"`, so the project only builds under Zig 0.17.
+The dependencies (`httpx` 0.2.2 and `zig-curl`) declare `minimum_zig_version =
+"0.17.0"`, but the project itself requires `0.17.1` (its own
+`minimum_zig_version`; the 0.17.1 bug-fix release resolves the 0.17.0
+regressions and its `zig fmt` is the canonical formatter), so the project only
+builds under Zig 0.17.1+.
 
 - Build/test with the project-local wrapper: `./zig build`, `./zig build test`.
-- It pins to a 0.17 toolchain (set `ZIG_17` to override, e.g. `/snap/zig/17037/zig`).
+- It pins to a 0.17.1+ toolchain (set `ZIG_17` to override, e.g. `/snap/zig/17198/zig`).
 - Both deps are **local path dependencies** in `build.zig.zon`:
   `curl -> ../zig-curl` and `httpx -> ../httpx.zig`. They must exist as siblings
   of this checkout. If a sibling is missing, the `./zig` wrapper clones it from
@@ -21,7 +24,7 @@ The dependencies (`httpx` 0.2.2 and `zig-curl`) both declare
 
 ## Zig 0.17 language/toolchain quirks in this codebase
 
-Confirmed against the 0.17 toolchain. Avoid these (they do not compile):
+Confirmed against the 0.17.1 toolchain. Avoid these (they do not compile):
 
 - **No backtick multiline string literals.** `` `...` `` is rejected. Use regular
   `"..."` strings (concatenate with `++` if needed).

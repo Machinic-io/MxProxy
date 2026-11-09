@@ -11,7 +11,7 @@ const router_mod = @import("router");
 
 /// One rule of a test scenario.
 const Rule = struct {
-    @"type": []const u8,
+    type: []const u8,
     local: []const u8,
     remote: []const u8,
 };

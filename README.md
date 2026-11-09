@@ -4,7 +4,7 @@ A fast, lightweight HTTP **reverse proxy** written in [Zig](https://ziglang.org)
 
 [![Build and test](https://github.com/Machinic-io/MxProxy/actions/workflows/ci.yml/badge.svg)](https://github.com/Machinic-io/MxProxy/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![Zig](https://img.shields.io/badge/Zig-0.17.0-informational)](https://ziglang.org/)
+[![Zig](https://img.shields.io/badge/Zig-0.17.1-informational)](https://ziglang.org/)
 
 ## Highlights
 
@@ -85,7 +85,7 @@ Upstream transfers are driven directly against [libcurl](https://curl.se/), the 
 
 ## Requirements
 
-- **Zig 0.17** — the project pins its toolchain (see [Building](#building)).
+- **Zig 0.17.1** — the project pins its toolchain (see [Building](#building)).
 - **System libcurl** — e.g. `libcurl4-openssl-dev` on Debian/Ubuntu. The build links against it rather than vendoring.
 - **Local dependency checkouts** as siblings of this repo (referenced by `build.zig.zon`):
   - [`zig-curl`](https://github.com/jiacai2050/zig-curl) → `../zig-curl` (libcurl C bindings)
@@ -94,7 +94,7 @@ Upstream transfers are driven directly against [libcurl](https://curl.se/), the 
 
 ## Building
 
-The repo ships a `./zig` wrapper that pins the build to a Zig 0.17 toolchain, so you do not need a matching `zig` on your `PATH`:
+The repo ships a `./zig` wrapper that pins the build to a Zig 0.17.1+ toolchain, so you do not need a matching `zig` on your `PATH`:
 
 ```sh
 # Build the MxProxy executable
@@ -107,10 +107,10 @@ The repo ships a `./zig` wrapper that pins the build to a Zig 0.17 toolchain, so
 ./zig build run -- --port=8080 --upstream-host=https://example.com
 ```
 
-Prefer to call `zig` directly? Point the wrapper at your 0.17 toolchain:
+Prefer to call `zig` directly? Point the wrapper at your 0.17.1+ toolchain:
 
 ```sh
-ZIG_17=/path/to/zig-0.17 ./zig build
+ZIG_17=/path/to/zig-0.17.1 ./zig build
 ```
 
 Cross-compiling for another platform? Pass `-Dtarget=` together with

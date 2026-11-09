@@ -24,7 +24,7 @@ jobs:
     # 5 min under runner load; leave headroom so a slow network isn't a red X.
     timeout-minutes: 10
     env:
-      ZIG_VERSION: 0.17.0
+      ZIG_VERSION: 0.17.1
       # Pinned dep commits (all declare minimum_zig_version 0.17.0).
       ZIG_CURL_REF: 9c0f1d211ad22dd0f4c20aa54060c1d9f163595a
       HTTPX_REF: deacfacea9a83c060d65ad65da1e40fa2edadc43

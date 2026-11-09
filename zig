@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Pin this project to a Zig 0.17 toolchain and bootstrap the local path deps.
+# Pin this project to a Zig 0.17.1+ toolchain and bootstrap the local path deps.
 #
-# The dependencies (httpx 0.2.2, zig-curl and zig-regex) declare
-# minimum_zig_version 0.17.0, so the project only builds under Zig 0.17. Run
-# `./zig build` instead of a bare `zig build` to guarantee the right toolchain
-# regardless of what `zig` resolves to on the machine.
+# build.zig.zon requires minimum_zig_version 0.17.1 (the 0.17.1 bug-fix release
+# resolves the 0.17.0 regressions), so the project only builds under Zig 0.17.1+.
+# Run `./zig build` instead of a bare `zig build` to guarantee the right
+# toolchain regardless of what `zig` resolves to on the machine.
 #
 # build.zig.zon links zig-curl, httpx and zig-regex by sibling path (../zig-curl,
 # ../httpx.zig and ../zig-regex). If a sibling is missing it is cloned from
@@ -13,9 +13,9 @@
 # pin or edit survives.
 #
 # Toolchain resolution order:
-#   1. $ZIG_17 if set and it reports 0.17.x
-#   2. the default `zig` if it already reports 0.17.x
-#   3. a known local 0.17 toolchain (snap, Homebrew, Nix, or a tarball in $HOME)
+#   1. $ZIG_17 if set and it reports 0.17.1+
+#   2. the default `zig` if it already reports 0.17.1+
+#   3. a known local 0.17.1+ toolchain (snap, Homebrew, Nix, or a tarball in $HOME)
 set -euo pipefail
 
 # --- Bootstrap local path deps ------------------------------------------------
@@ -53,15 +53,22 @@ ensure_dep zig-regex "$ZIG_REGEX_REPO" "$ZIG_REGEX_REF"
 # --- End bootstrap ------------------------------------------------------------
 
 is17() {
-  case "$("$1" version 2>/dev/null)" in
-  0.17*) return 0 ;;
+  # Accepts Zig 0.17.1+ (build.zig.zon requires 0.17.1; 0.17.0 is rejected).
+  local ver patch
+  ver="$("$1" version 2>/dev/null)" || return 1
+  case "$ver" in
+  0.17.*)
+    patch="${ver#0.17.}"
+    patch="${patch%%[!0-9]*}"
+    [ -n "$patch" ] && [ "$patch" -ge 1 ]
+    ;;
   *) return 1 ;;
   esac
 }
 
 if [ -n "${ZIG_17:-}" ]; then
   if is17 "$ZIG_17"; then exec "$ZIG_17" "$@"; fi
-  echo "error: ZIG_17=$ZIG_17 is not a Zig 0.17 toolchain" >&2
+  echo "error: ZIG_17=$ZIG_17 is not a Zig 0.17.1+ toolchain" >&2
   exit 1
 fi
 
@@ -76,5 +83,5 @@ for cand in /snap/zig/*/zig /snap/zig/*/bin/zig \
   if is17 "$cand"; then exec "$cand" "$@"; fi
 done
 
-echo "error: no Zig 0.17 toolchain found (searched PATH, snap, Homebrew, Nix, \$HOME); set ZIG_17 to the path of your 0.17 zig" >&2
+echo "error: no Zig 0.17.1+ toolchain found (searched PATH, snap, Homebrew, Nix, \$HOME); set ZIG_17 to the path of your 0.17.1+ zig" >&2
 exit 1
