@@ -1,7 +1,7 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const tcp = httpx.tcp;
-const address = httpx.address;
+const address = httpx.net.address;
 const posix = std.posix;
 const forward_mod = @import("forward");
 

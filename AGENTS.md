@@ -2,7 +2,8 @@
 
 ## Toolchain: build with Zig 0.17.1
 
-The dependencies (`httpx` 0.2.2 and `zig-curl`) declare `minimum_zig_version =
+The dependencies (`httpx` 0.2.3+ and `zig-curl` v0.6.0) declare
+`minimum_zig_version =
 "0.17.0"`, but the project itself requires `0.17.1` (its own
 `minimum_zig_version`; the 0.17.1 bug-fix release resolves the 0.17.0
 regressions and its `zig fmt` is the canonical formatter), so the project only

@@ -28,9 +28,9 @@ DEPS_ROOT="$(dirname "$SCRIPT_DIR")"
 ZIG_CURL_REPO="https://github.com/jiacai2050/zig-curl"
 HTTPX_REPO="https://github.com/muhammad-fiaz/httpx.zig"
 ZIG_REGEX_REPO="https://github.com/zig-utils/zig-regex"
-ZIG_CURL_REF="${ZIG_CURL_REF:-9c0f1d211ad22dd0f4c20aa54060c1d9f163595a}"
-HTTPX_REF="${HTTPX_REF:-deacfacea9a83c060d65ad65da1e40fa2edadc43}"
-ZIG_REGEX_REF="${ZIG_REGEX_REF:-fdd9c2e333ea6ac2fd06d080d939ef7f11d61b1b}"
+ZIG_CURL_REF="${ZIG_CURL_REF:-0bc73f43cbd736fb7801b31b91c2ea0cca145c67}"
+HTTPX_REF="${HTTPX_REF:-cbed04b165d3301e5fa9ff7339f64072c57bc8cb}"
+ZIG_REGEX_REF="${ZIG_REGEX_REF:-16df9870ca4a4ec8d0b932e90a62a8b3fb9af563}"
 
 # Ensure the sibling $1 is a checkout of $2 at $3; clone it if it is missing.
 # A sibling that already has a build.zig.zon is treated as present and kept.

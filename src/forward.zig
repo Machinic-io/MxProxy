@@ -357,7 +357,7 @@ fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void
 
     // 4. Decide body framing from headers, never from the method: GET/DELETE/
     //    HEAD may carry a body too.
-    const framing = parser.decideFraming(field_slice, false, 0, method.len) catch |err| {
+    const framing = parser.decideFraming(field_slice, false, 0, method) catch |err| {
         // CL/TE smuggling defenses and bad Content-Length values: the client
         // sent contradictory framing -> 400.
         const status = headParseErrorStatus(err);
