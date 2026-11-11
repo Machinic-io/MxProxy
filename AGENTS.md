@@ -1,5 +1,11 @@
 # AGENTS.md
 
+## Git workflow
+
+- **Don't commit changes unless explicitly told to.** Leave edits in the
+  working tree for review; staging and committing (and pushing) are the
+  user's call.
+
 ## Toolchain: build with Zig 0.17.1
 
 The dependencies (`httpx` 0.2.3, `zig-curl` v0.6.0, `zig-regex` 0.2.1) declare
