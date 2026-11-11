@@ -25,10 +25,6 @@ jobs:
     timeout-minutes: 10
     env:
       ZIG_VERSION: 0.17.1
-      # Pinned dep commits (all declare minimum_zig_version 0.17.0).
-      ZIG_CURL_REF: 0bc73f43cbd736fb7801b31b91c2ea0cca145c67
-      HTTPX_REF: cbed04b165d3301e5fa9ff7339f64072c57bc8cb
-      ZIG_REGEX_REF: 16df9870ca4a4ec8d0b932e90a62a8b3fb9af563
       # Run the (Node 20) checkout/cache actions on Node 24 to silence the
       # runner deprecation warnings.
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -37,41 +33,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # build.zig.zon links zig-curl, httpx and zig-regex via local paths
-      # (../zig-curl, ../httpx.zig and ../zig-regex), so all three must exist as
-      # siblings of the project checkout, pinned to the commits that build under
-      # Zig 0.17.
-      #
-      # actions/checkout@v4 refuses to write outside GITHUB_WORKSPACE, so each
-      # dep is checked out into ./deps/ first, then moved to its sibling slot.
-      - name: Checkout zig-curl dependency
-        uses: actions/checkout@v4
-        with:
-          repository: jiacai2050/zig-curl
-          ref: ${{ env.ZIG_CURL_REF }}
-          path: deps/zig-curl
-
-      - name: Checkout httpx dependency
-        uses: actions/checkout@v4
-        with:
-          repository: muhammad-fiaz/httpx.zig
-          ref: ${{ env.HTTPX_REF }}
-          path: deps/httpx.zig
-
-      - name: Checkout zig-regex dependency
-        uses: actions/checkout@v4
-        with:
-          repository: zig-utils/zig-regex
-          ref: ${{ env.ZIG_REGEX_REF }}
-          path: deps/zig-regex
-
-      - name: Move dependencies to sibling locations
-        run: |
-          set -euo pipefail
-          deps_root="$(dirname "$GITHUB_WORKSPACE")"
-          mv "$GITHUB_WORKSPACE/deps/zig-curl" "$deps_root/zig-curl"
-          mv "$GITHUB_WORKSPACE/deps/httpx.zig" "$deps_root/httpx.zig"
-          mv "$GITHUB_WORKSPACE/deps/zig-regex" "$deps_root/zig-regex"
+      # Deps (zig-curl, httpx, zig-regex) are URL deps pinned by content hash
+      # in build.zig.zon; `./zig build` fetches them on first use, so no
+      # sibling checkouts or manual setup are needed here.
 
       # The build links against the system libcurl (link_vendor = false).
       - name: Install libcurl
@@ -88,8 +52,9 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      # URL deps (zstd, brotli, env, ...) are extracted into zig-pkg/. Keyed on
-      # the .zon so a dep bump refetches; otherwise the ~87MB isn't re-downloaded.
+      # All URL deps (our three plus httpx's zstd, brotli, env, ...) are
+      # extracted into zig-pkg/. Keyed on the .zon so a dep bump refetches;
+      # otherwise the ~100MB isn't re-downloaded.
       - name: Cache Zig package cache
         uses: actions/cache@v4
         with:
