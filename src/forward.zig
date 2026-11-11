@@ -1,8 +1,8 @@
 const std = @import("std");
 const curl = @import("curl");
 const httpx = @import("httpx");
-const tcp = httpx.tcp;
 const parser = httpx.http1.parser;
+const stream_mod = @import("stream");
 const config_mod = @import("config");
 const router_mod = @import("router");
 const headers_mod = @import("headers");
@@ -87,9 +87,12 @@ pub fn init(config: *const config_mod.Config, verbose: bool, silent: bool) !Self
 }
 
 /// Handle one client connection. Runs on its own thread; the caller owns and
-/// closes the socket. Errors are logged (or swallowed for benign close).
-pub fn handle(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) void {
-    self.forward(allocator, socket) catch |err| {
+/// closes the socket. `seed` carries bytes already consumed from the stream by
+/// the accept side (protocol detection on a shared HTTP/HTTPS port): they are
+/// the first bytes of the request head and are prefixed to the head read.
+/// Errors are logged (or swallowed for benign close).
+pub fn handle(self: *Self, allocator: std.mem.Allocator, socket: *stream_mod.Stream, seed: []const u8) void {
+    self.forward(allocator, socket, seed) catch |err| {
         switch (err) {
             // Benign close, and upstream errors already reported by forward().
             error.ClientClosed, error.Curl => {},
@@ -109,7 +112,7 @@ const BodyMode = enum { none, socket, chunked };
 /// decoded and re-emitted, so the upstream sees a chunked (HTTP/1.1) / unframed
 /// (HTTP/2) upload rather than a Content-Length one.
 const ChunkedStream = struct {
-    socket: *const tcp.Socket,
+    socket: *stream_mod.Stream,
     allocator: std.mem.Allocator,
     decoder: parser.ChunkedDecoder,
     work: []u8, // raw bytes read from the socket (capacity work_cap).
@@ -121,7 +124,7 @@ const ChunkedStream = struct {
     const work_cap = 64 * 1024;
     const decoded_cap = 128 * 1024;
 
-    fn init(allocator: std.mem.Allocator, socket: *const tcp.Socket, seed: []const u8) !*ChunkedStream {
+    fn init(allocator: std.mem.Allocator, socket: *stream_mod.Stream, seed: []const u8) !*ChunkedStream {
         const cs = try allocator.create(ChunkedStream);
         errdefer allocator.destroy(cs);
         cs.allocator = allocator;
@@ -209,7 +212,7 @@ const ClientFault = error{
 /// `chunked_stream` are owned here (freed in deinit); `socket`/
 /// `response_overrides` borrow from the caller.
 const Ctx = struct {
-    socket: *const tcp.Socket,
+    socket: *stream_mod.Stream,
     allocator: std.mem.Allocator,
     body_mode: BodyMode,
     tail: []const u8,
@@ -294,10 +297,19 @@ const Ctx = struct {
     }
 };
 
-fn forward(self: *Self, allocator: std.mem.Allocator, socket: *tcp.Socket) !void {
+fn forward(self: *Self, allocator: std.mem.Allocator, socket: *stream_mod.Stream, seed: []const u8) !void {
     // 1. Read and parse the request head + headers.
     var head_buf: [65536]u8 = undefined;
     var total: usize = 0;
+    // Protocol-detection bytes consumed by the accept side (shared HTTP/HTTPS
+    // port): they are literally the start of the request head, so prefill the
+    // buffer and continue reading from there. The seed is at most a few bytes;
+    // the cap guard is paranoia, not plumbing.
+    if (seed.len > 0) {
+        if (seed.len > head_buf.len) return error.Bug;
+        @memcpy(head_buf[0..seed.len], seed);
+        total = seed.len;
+    }
     var head_res: parser.HeadResult = undefined;
     var fields: [parser.DEFAULT_MAX_HEADERS]parser.Field = undefined;
     var blk: parser.HeaderBlockResult = undefined;
@@ -758,7 +770,7 @@ fn fixHttp2Head(allocator: std.mem.Allocator, head: []const u8) ![]u8 {
     return buf.toOwnedSlice();
 }
 
-fn writeError(socket: *const tcp.Socket, allocator: std.mem.Allocator, code: u16) !void {
+fn writeError(socket: *stream_mod.Stream, allocator: std.mem.Allocator, code: u16) !void {
     const reason_phrase = switch (code) {
         400 => "Bad Request",
         404 => "Not Found",
