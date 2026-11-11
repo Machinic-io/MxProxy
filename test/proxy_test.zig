@@ -6,9 +6,17 @@ const router_mod = @import("router");
 const headers_mod = @import("headers");
 const forward_mod = @import("forward");
 const server_mod = @import("server");
+const stream_mod = @import("stream");
 const httpx = @import("httpx");
 const tcp = httpx.tcp;
 const parser = httpx.http1.parser;
+
+/// Self-signed test identity (see test/fixtures/tls/README.md). The TLS tests
+/// pin the cert as the client's trust anchor (verify .caBundle + caPem), so
+/// the full certificate-verification path runs; nothing is skipped except the
+/// system-trust membership no self-signed test cert can have.
+const TEST_CERT_PEM = @embedFile("fixtures/tls/localhost.crt");
+const TEST_KEY_PEM = @embedFile("fixtures/tls/localhost.key");
 
 // NOTE: the pinned Zig 0.17 toolchain does not accept backtick multiline string
 // literals, so all JSON fixtures here use regular double-quoted strings.
@@ -1097,7 +1105,8 @@ fn upstreamOnce(listener: *tcp.Listener, io: std.Io, allocator: std.mem.Allocato
 /// Serve one accepted proxy connection: drive the forwarder, then close.
 fn serveProxySocket(socket: tcp.Socket, allocator: std.mem.Allocator, forwarder: *forward_mod.Forwarder) void {
     var s = socket;
-    forwarder.handle(allocator, &s);
+    var stream = stream_mod.Stream.plain(&s);
+    forwarder.handle(allocator, &stream, &.{});
     s.close();
 }
 
@@ -1898,4 +1907,421 @@ test "server: requestShutdown reports a repeat signal" {
     // signal handler hard-exits on (untestable in-process: _exit).
     try std.testing.expect(!server.requestShutdown());
     try std.testing.expect(server.requestShutdown());
+}
+
+// ---------------------------------------------------------------------------
+// Local-side HTTPS: the listen port auto-detects TLS vs plain HTTP per
+// connection (peek + classify in server.zig). The tests use the self-signed
+// fixture in test/fixtures/tls/ (see its README) and pin it as the client's
+// trust anchor, so the full certificate-verification path runs on the happy
+// path — and a negative test proves verification is actually enforced.
+// ---------------------------------------------------------------------------
+
+/// In-process upstream serving `n` connections in sequence (one canned 200
+/// each), for tests that drive the same proxy more than once.
+fn upstreamMany(listener: *tcp.Listener, io: std.Io, allocator: std.mem.Allocator, n: usize) void {
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const socket = listener.accept(io) catch return;
+        serveUpstreamSocket(socket, allocator);
+    }
+}
+
+/// Read a client until EOF (the proxy closes every connection after one
+/// request), collecting the full response bytes.
+fn collectResponse(reader: anytype, allocator: std.mem.Allocator) ![]u8 {
+    var resp = std.array_list.Managed(u8).init(allocator);
+    errdefer resp.deinit();
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = reader.read(&chunk) catch break;
+        if (n == 0) break;
+        try resp.appendSlice(chunk[0..n]);
+    }
+    return resp.toOwnedSlice();
+}
+
+/// A TLS-configured `server_mod.Server` (fixture identity) on an ephemeral
+/// port, wired to an in-process mock upstream — the server.zig accept loop
+/// itself, not the hand-rolled proxyOnce harness, so the tests exercise the
+/// real peek/classify/handshake path. Heap-allocated so the forwarder pointer
+/// the server holds stays stable.
+const TlsProxy = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: *Config,
+    forwarder: forward_mod.Forwarder,
+    server: server_mod.Server,
+    server_thread: std.Thread,
+    upstream: tcp.Listener,
+
+    fn start(io: std.Io, allocator: std.mem.Allocator, cert: []const u8, key: []const u8) !*TlsProxy {
+        var upstream = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
+        errdefer upstream.close(io);
+
+        const upstream_host = try allocator.print("http://127.0.0.1:{d}", .{upstream.localPort()});
+        defer allocator.free(upstream_host);
+        const cfg_json = try allocator.print("{{\"timeout_ms\":5000,\"connect_timeout_ms\":1000,\"upstream\":[{{\"host\":\"{s}\"}}]}}", .{upstream_host});
+        defer allocator.free(cfg_json);
+        var cfg = try Config.load(io, allocator, null, cfg_json);
+        errdefer cfg.deinit();
+        // Set after load: the strings are test constants, and this skips the
+        // JSON-escaping dance an inline-PEM config string would need. The
+        // server reads them from the config in Server.init.
+        cfg.tls_certificate = cert;
+        cfg.tls_private_key = key;
+
+        const self = try allocator.create(TlsProxy);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .cfg = cfg,
+            .forwarder = try forward_mod.Forwarder.init(cfg, false, false),
+            .server = undefined,
+            .server_thread = undefined,
+            .upstream = upstream,
+        };
+        self.server = server_mod.Server.init(&self.forwarder, allocator, io);
+        self.server.port = 0;
+        self.server_thread = try std.Thread.spawn(.{}, serverRun, .{&self.server});
+
+        // Wait for run() to finish binding: bound_address.port holds the
+        // resolved ephemeral port (also proves TLS init did not fail — a TLS
+        // startup failure returns before binding and leaves the port at 0).
+        var spins: u32 = 0;
+        while (self.server.bound_address.port == 0 and spins < 1000000) {
+            std.Thread.yield() catch {};
+            spins += 1;
+        }
+        if (self.server.bound_address.port == 0) return error.TlsProxyBindTimeout;
+        return self;
+    }
+
+    fn port(self: *const TlsProxy) u16 {
+        return self.server.bound_address.port;
+    }
+
+    fn stop(self: *TlsProxy) void {
+        _ = self.server.requestShutdown();
+        self.server_thread.join();
+        self.upstream.close(self.io);
+        self.cfg.deinit();
+        self.allocator.destroy(self);
+    }
+};
+
+test "integration: https relay on the shared HTTP/HTTPS port" {
+    const allocator = std.heap.page_allocator;
+    var io_ctx = try httpx.IoContext.init(std.testing.allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io;
+
+    var tp = try TlsProxy.start(io, allocator, TEST_CERT_PEM, TEST_KEY_PEM);
+    defer tp.stop();
+
+    // NOTE: the mock-upstream thread is joined explicitly on the success path
+    // only. Joining it on a test failure would hang forever (the failure may
+    // happen before any request reaches the upstream, leaving the thread
+    // blocked in accept()).
+    const up_thread = try std.Thread.spawn(.{}, upstreamMany, .{ &tp.upstream, io, allocator, @as(usize, 1) });
+
+    var client = tcp.connect(io, "127.0.0.1", tp.port()) catch return IntError.ConnectFailed;
+    defer client.close();
+    var tls_client = try httpx.tls.Client.init(allocator, io, .{});
+    defer tls_client.deinit();
+    // Pinned trust anchor: the fixture cert is the only root, so dates,
+    // hostname and chain signature are all checked — full verification.
+    // `.transport = .native` is required to exercise ALPN: the default
+    // `.auto` routes http/1.1-only dials to the std.crypto.tls transport,
+    // which implements no ALPN at all (alpn.zig's opening line: "Zig
+    // std.crypto.tls does NOT implement ALPN").
+    var tls_conn = try tls_client.connect(&client, "127.0.0.1", .{
+        .verify = .caBundle,
+        .caPem = TEST_CERT_PEM,
+        .alpn = &.{.@"http/1.1"},
+        .transport = .native,
+    });
+    defer tls_conn.deinit();
+
+    // The proxy must never hand out h2: it speaks HTTP/1.1 only.
+    try std.testing.expectEqual(httpx.tls.alpn.Protocol.@"http/1.1", tls_conn.alpn().?);
+
+    tls_conn.writeAll("GET /secure HTTP/1.1\r\nHost: local\r\n\r\n") catch return IntError.RelayFailed;
+    const resp = try collectResponse(&tls_conn, allocator);
+    defer allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "HTTP/1.1 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "X-Marker: up") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "bodylen=0") != null);
+    up_thread.join();
+}
+
+test "integration: plain http still works on the TLS-configured port" {
+    const allocator = std.heap.page_allocator;
+    var io_ctx = try httpx.IoContext.init(std.testing.allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io;
+
+    var tp = try TlsProxy.start(io, allocator, TEST_CERT_PEM, TEST_KEY_PEM);
+    defer tp.stop();
+
+    const up_thread = try std.Thread.spawn(.{}, upstreamMany, .{ &tp.upstream, io, allocator, @as(usize, 1) });
+
+    var client = tcp.connect(io, "127.0.0.1", tp.port()) catch return IntError.ConnectFailed;
+    defer client.close();
+    client.writeAll("GET /plain HTTP/1.1\r\nHost: local\r\n\r\n") catch return IntError.RelayFailed;
+    const resp = try collectResponse(&client, allocator);
+    defer allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "HTTP/1.1 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "X-Marker: up") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "bodylen=0") != null);
+    up_thread.join();
+}
+
+test "integration: peeked prefix is seeded into the request head" {
+    const allocator = std.heap.page_allocator;
+    var io_ctx = try httpx.IoContext.init(std.testing.allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io;
+
+    var tp = try TlsProxy.start(io, allocator, TEST_CERT_PEM, TEST_KEY_PEM);
+    defer tp.stop();
+
+    const up_thread = try std.Thread.spawn(.{}, upstreamMany, .{ &tp.upstream, io, allocator, @as(usize, 1) });
+
+    var client = tcp.connect(io, "127.0.0.1", tp.port()) catch return IntError.ConnectFailed;
+    defer client.close();
+    // Two writes: the first satisfies the 3-byte classification peek ("GET "),
+    // the rest arrives as a separate segment. The seed path must splice them
+    // back together into one parsable request head.
+    client.writeAll("GET ") catch return IntError.RelayFailed;
+    client.writeAll("/split HTTP/1.1\r\nHost: local\r\n\r\n") catch return IntError.RelayFailed;
+    const resp = try collectResponse(&client, allocator);
+    defer allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "HTTP/1.1 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "bodylen=0") != null);
+    up_thread.join();
+}
+
+test "integration: shared port rejects junk and survives probe connections" {
+    const allocator = std.heap.page_allocator;
+    var io_ctx = try httpx.IoContext.init(std.testing.allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io;
+
+    var tp = try TlsProxy.start(io, allocator, TEST_CERT_PEM, TEST_KEY_PEM);
+    defer tp.stop();
+
+    // Junk first bytes classify as plain and die in the head parser: 400.
+    {
+        var c = tcp.connect(io, "127.0.0.1", tp.port()) catch return IntError.ConnectFailed;
+        defer c.close();
+        c.writeAll("PINGPING\r\n\r\n") catch return IntError.RelayFailed;
+        const resp = try collectResponse(&c, allocator);
+        defer allocator.free(resp);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "HTTP/1.1 400") != null);
+    }
+    // A truncated TLS-looking prefix (2 bytes): too short to classify as TLS.
+    // The client must CLOSE after the 2 bytes — the server's peek loop waits
+    // for the third byte (or EOF), so a client that stays connected waiting
+    // for a response would deadlock the probe (a stalled real-world client
+    // ties a thread, same as a stalled head read; accepted behavior).
+    {
+        var c = tcp.connect(io, "127.0.0.1", tp.port()) catch return IntError.ConnectFailed;
+        c.writeAll(&[_]u8{ 0x16, 0x03 }) catch {
+            c.close();
+            return IntError.RelayFailed;
+        };
+        c.close();
+    }
+    // A 3-byte TLS-record prefix then close: classified TLS, the handshake
+    // fails cleanly (info-level log). No crash.
+    {
+        var c = tcp.connect(io, "127.0.0.1", tp.port()) catch return IntError.ConnectFailed;
+        c.writeAll(&[_]u8{ 0x16, 0x03, 0x03 }) catch {
+            c.close();
+            return IntError.RelayFailed;
+        };
+        c.close();
+    }
+
+    // The accept loop survived every probe: the port still relays.
+    const up_thread = try std.Thread.spawn(.{}, upstreamMany, .{ &tp.upstream, io, allocator, @as(usize, 1) });
+    var c = tcp.connect(io, "127.0.0.1", tp.port()) catch return IntError.ConnectFailed;
+    defer c.close();
+    c.writeAll("GET /after-probes HTTP/1.1\r\nHost: local\r\n\r\n") catch return IntError.RelayFailed;
+    const resp = try collectResponse(&c, allocator);
+    defer allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "HTTP/1.1 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "bodylen=0") != null);
+    up_thread.join();
+}
+
+test "integration: tls verification is enforced on the client side" {
+    const allocator = std.heap.page_allocator;
+    var io_ctx = try httpx.IoContext.init(std.testing.allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io;
+
+    var tp = try TlsProxy.start(io, allocator, TEST_CERT_PEM, TEST_KEY_PEM);
+    defer tp.stop();
+
+    var tls_client = try httpx.tls.Client.init(allocator, io, .{}); // system trust
+    defer tls_client.deinit();
+
+    // Without pinning the fixture as the anchor, the self-signed proxy cert
+    // MUST be refused (system trust only). If verification were skipped, this
+    // handshake would succeed and the test would fail. `.transport = .native`
+    // pins the verification path under test (httpx's own verifier): the std
+    // transport skips the SAN check for IP-literal hosts entirely.
+    {
+        var c = tcp.connect(io, "127.0.0.1", tp.port()) catch return IntError.ConnectFailed;
+        defer c.close();
+        if (tls_client.connect(&c, "127.0.0.1", .{ .transport = .native })) |v| {
+            var conn = v; // the if-payload is const; copy it to deinit
+            conn.deinit();
+            return error.UnpinnedProxyCertAccepted;
+        } else |_| {}
+    }
+    // Even with the fixture pinned, a hostname outside its SAN must fail.
+    {
+        var c = tcp.connect(io, "127.0.0.1", tp.port()) catch return IntError.ConnectFailed;
+        defer c.close();
+        if (tls_client.connect(&c, "10.0.0.1", .{
+            .verify = .caBundle,
+            .caPem = TEST_CERT_PEM,
+            .transport = .native,
+        })) |v| {
+            var conn = v;
+            conn.deinit();
+            return error.HostMismatchAccepted;
+        } else |_| {}
+    }
+}
+
+test "integration: tls material loads from file paths" {
+    const allocator = std.heap.page_allocator;
+    var io_ctx = try httpx.IoContext.init(std.testing.allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io;
+
+    // Relative to the test binary's cwd (the project root under `zig build
+    // test`). A bad path would leave run() failed before binding, which the
+    // start() spin detects as TlsProxyBindTimeout.
+    var tp = try TlsProxy.start(io, allocator, "test/fixtures/tls/localhost.crt", "test/fixtures/tls/localhost.key");
+    defer tp.stop();
+
+    // The handshake is the point of this test: httpx validates path material
+    // at init but uses the configured string verbatim at handshake time, so
+    // a server that was handed the raw paths starts fine yet fails every
+    // TLS connection. Only a real handshake (not plain HTTP on the same
+    // port) proves the paths were resolved to PEM content.
+    const up_thread = try std.Thread.spawn(.{}, upstreamMany, .{ &tp.upstream, io, allocator, @as(usize, 1) });
+
+    var client = tcp.connect(io, "127.0.0.1", tp.port()) catch return IntError.ConnectFailed;
+    defer client.close();
+    var tls_client = try httpx.tls.Client.init(allocator, io, .{});
+    defer tls_client.deinit();
+    var tls_conn = try tls_client.connect(&client, "127.0.0.1", .{
+        .verify = .caBundle,
+        .caPem = TEST_CERT_PEM,
+        .alpn = &.{.@"http/1.1"},
+        .transport = .native,
+    });
+    defer tls_conn.deinit();
+    tls_conn.writeAll("GET /from-path HTTP/1.1\r\nHost: local\r\n\r\n") catch return IntError.RelayFailed;
+    const resp = try collectResponse(&tls_conn, allocator);
+    defer allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "HTTP/1.1 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "bodylen=0") != null);
+    up_thread.join();
+}
+
+test "config: tls keys decode from json" {
+    const allocator = std.testing.allocator;
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+
+    var cfg = try Config.load(io_ctx.io, allocator, null, "{\"tls_certificate\": \"inline-cert\", \"tls_private_key\": \"inline-key\", \"upstream\": [{\"host\": \"http://a.example\"}]}");
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings("inline-cert", cfg.tls_certificate.?);
+    try std.testing.expectEqualStrings("inline-key", cfg.tls_private_key.?);
+    try cfg.validate();
+}
+
+test "config: half a tls identity is rejected" {
+    const allocator = std.testing.allocator;
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+
+    var cfg = try Config.load(io_ctx.io, allocator, null, "{\"upstream\": [{\"host\": \"http://a.example\"}]}");
+    defer cfg.deinit();
+
+    // No TLS: valid.
+    try cfg.validate();
+    // Certificate without key: invalid.
+    cfg.tls_certificate = "cert";
+    try std.testing.expectError(config_mod.ConfigError.TlsConfigIncomplete, cfg.validate());
+    // Both: valid.
+    cfg.tls_private_key = "key";
+    try cfg.validate();
+    // Key without certificate: invalid.
+    cfg.tls_certificate = null;
+    try std.testing.expectError(config_mod.ConfigError.TlsConfigIncomplete, cfg.validate());
+}
+
+test "tls: fixture certificate is parseable and long-lived" {
+    const allocator = std.testing.allocator;
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+
+    var chain = try httpx.tls.certificate.parseCertificateChainPem(allocator, TEST_CERT_PEM);
+    defer chain.deinit();
+    const leaf = chain.leaf() orelse return error.TlsFixtureUnparsable;
+    if (!leaf.isSelfSigned()) return error.TlsFixtureUnparsable;
+    // Self-diagnosing expiry guard: failing here says exactly what to do,
+    // instead of leaving a handshake failure to decode years from now.
+    // (`leaf.parsed.validity.not_after` directly rather than httpx's
+    // `notAfter()` helper: that helper does not compile when called — a
+    // latent u64/i64 bug in httpx 0.2.3, dormant because nothing in httpx
+    // itself calls it.)
+    const not_after: u64 = leaf.parsed.validity.not_after;
+    const now_ms: u64 = @intCast(httpx.clock.millisNow(io_ctx.io));
+    const now_sec: u64 = now_ms / 1000;
+    if (not_after < now_sec + 30 * 24 * 60 * 60) {
+        std.debug.print("\nTLS test fixture certificate expires within 30 days — regenerate it per test/fixtures/tls/README.md\n", .{});
+        return error.TlsFixtureExpiring;
+    }
+}
+
+test "tls: server identity validates at init and rejects garbage material" {
+    const allocator = std.testing.allocator;
+    var io_ctx = try httpx.IoContext.init(allocator);
+    defer io_ctx.deinit();
+
+    // Fixture material (inline-PEM form) parses: validateIdentity passes at
+    // init, not mid-handshake.
+    var srv = try httpx.tls.Server.init(allocator, io_ctx.io, .{
+        .certificatePem = TEST_CERT_PEM,
+        .privateKeyPem = TEST_KEY_PEM,
+        .alpn = &.{.@"http/1.1"},
+    });
+    srv.deinit();
+
+    // Structurally invalid PEM (but PEM-shaped, so it is not treated as a
+    // file path): must fail at init, never silently start a broken listener.
+    const garbage_cert = "-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----";
+    if (httpx.tls.Server.init(allocator, io_ctx.io, .{ .certificatePem = garbage_cert, .privateKeyPem = TEST_KEY_PEM })) |v| {
+        var bad = v;
+        bad.deinit();
+        return error.GarbageTlsIdentityAccepted;
+    } else |_| {}
+
+    // A nonexistent key file path: also fails at init (startup fail-fast for
+    // the file-path form).
+    if (httpx.tls.Server.init(allocator, io_ctx.io, .{ .certificatePem = TEST_CERT_PEM, .privateKeyPem = "no/such/key.pem" })) |v| {
+        var bad = v;
+        bad.deinit();
+        return error.MissingTlsKeyFileAccepted;
+    } else |_| {}
 }

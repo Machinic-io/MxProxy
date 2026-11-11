@@ -17,6 +17,9 @@ pub const ConfigError = error{
     /// already cap the transfer) and makes the timeout-kind heuristic
     /// ambiguous.
     ConnectTimeoutNotLessThanOverall,
+    /// A local-side TLS certificate was configured without a private key, or
+    /// vice versa (see validate). Half a TLS identity cannot serve handshakes.
+    TlsConfigIncomplete,
 };
 
 /// Header overrides for a single direction.
@@ -135,6 +138,8 @@ pub const Upstream = struct {
 const RawConfig = struct {
     port: ?u16 = null,
     bind_address: ?[]const u8 = null,
+    tls_certificate: ?[]const u8 = null,
+    tls_private_key: ?[]const u8 = null,
     interface: ?[]const u8 = null,
     timeout_ms: ?usize = null,
     connect_timeout_ms: ?usize = null,
@@ -164,6 +169,15 @@ pub const Config = struct {
     /// Client-facing listen address (e.g. "127.0.0.1"). `null` means all
     /// interfaces (0.0.0.0). Set by `--bind`.
     bind_address: ?[]const u8 = null,
+    /// Local-side TLS certificate: PEM text or a path to a PEM file. With
+    /// `tls_private_key`, enables HTTPS on the listen port, which then
+    /// auto-detects TLS vs plain HTTP per connection. `null` disables TLS.
+    /// Set by `--tls-cert`.
+    tls_certificate: ?[]const u8 = null,
+    /// Private key for `tls_certificate` (PEM text or a path to a PEM file).
+    /// HTTPS is enabled only when both are set (see validate). Set by
+    /// `--tls-key`.
+    tls_private_key: ?[]const u8 = null,
     /// Default upstream-facing interface (see `Upstream.interface`).
     interface: ?[]const u8 = null,
     /// Default overall (total transfer) upstream timeout in milliseconds (see
@@ -265,6 +279,8 @@ pub const Config = struct {
 
         cfg.port = from_str.port orelse from_file.port orelse 8080;
         cfg.bind_address = from_str.bind_address orelse from_file.bind_address;
+        cfg.tls_certificate = from_str.tls_certificate orelse from_file.tls_certificate;
+        cfg.tls_private_key = from_str.tls_private_key orelse from_file.tls_private_key;
         cfg.interface = from_str.interface orelse from_file.interface;
         cfg.timeout_ms = from_str.timeout_ms orelse from_file.timeout_ms orelse 900000;
         cfg.connect_timeout_ms = from_str.connect_timeout_ms orelse from_file.connect_timeout_ms orelse 10000;
@@ -318,6 +334,11 @@ pub const Config = struct {
 
     pub fn validate(self: *const Self) !void {
         if (self.port == 0) return ConfigError.InvalidPort;
+
+        // A TLS identity needs both halves: a certificate without a key (or
+        // vice versa) cannot serve handshakes, and silently ignoring half an
+        // HTTPS request would be a footgun.
+        if ((self.tls_certificate != null) != (self.tls_private_key != null)) return ConfigError.TlsConfigIncomplete;
 
         // The overall (total transfer) timeout must exceed the connect timeout.
         // Checked at the top level (covers the catch-all upstream added by

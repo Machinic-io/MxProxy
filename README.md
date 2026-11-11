@@ -15,6 +15,7 @@ A fast, lightweight HTTP **reverse proxy** written in [Zig](https://ziglang.org)
 - **Transparent compression** — `Accept-Encoding`/`Content-Encoding` are relayed verbatim (never decoded), so the upstream can compress for the real client.
 - **Streaming bodies** — `Content-Length` and chunked request bodies are relayed, and response bodies stream straight from libcurl to the client. The proxy answers `Expect: 100-continue` itself (it sends `100 Continue` before pulling the body) and does not relay the header upstream.
 - **TLS** — HTTPS upstreams, with an opt-in `insecure` mode that skips certificate verification.
+- **Local-side HTTPS** — serve TLS on the listen port (`tls_certificate`/`tls_private_key`); the port auto-detects TLS vs plain HTTP per connection, so one port can serve both.
 - **Interface binding** — upstream traffic can be forced out through a specific network interface (e.g. `eth0`) via libcurl's `CURLOPT_INTERFACE`; a per-upstream `interface` falls back to the top-level default.
 - **Mature upstream engine** — upstream transfers are driven directly against the system libcurl.
 
@@ -160,6 +161,9 @@ Or from a config file:
 | `--config=<path>` | Path to a JSON config file. |
 | `--config-json=<json>` | Inline JSON config (top-level keys only). |
 | `--port=<u16>` | Listen port (default `8080`). |
+| `--bind=<ip>` | Listen address (default: all interfaces, `0.0.0.0`). |
+| `--tls-cert=<path>` | TLS certificate for the local listener: PEM file path or inline PEM. Enables HTTPS; plain HTTP is still served on the same port (auto-detected per connection). Requires `--tls-key`. |
+| `--tls-key=<path>` | TLS private key (PEM file path or inline PEM). Required with `--tls-cert`. |
 | `--timeout=<ms>` | Default overall upstream timeout in milliseconds (default `900000`). A per-upstream `timeout_ms` still overrides it. |
 | `--connect-timeout=<ms>` | Upstream connect timeout in milliseconds (default `10000`). A per-upstream `connect_timeout_ms` still overrides it. |
 | `--insecure` | Skip TLS certificate verification for all upstreams. A per-upstream `insecure` still overrides it. |
@@ -177,6 +181,9 @@ All fields are optional; omitted fields fall back to their defaults.
 ```json
 {
   "port": 8080,
+  "bind_address": "0.0.0.0",
+  "tls_certificate": "server.crt",
+  "tls_private_key": "server.key",
   "interface": "eth0",
   "timeout_ms": 900000,
   "connect_timeout_ms": 10000,
@@ -211,6 +218,9 @@ All fields are optional; omitted fields fall back to their defaults.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `port` | number | `8080` | Port to listen on. |
+| `bind_address` | string | _(all interfaces)_ | Listen address (e.g. `127.0.0.1`). |
+| `tls_certificate` | string | _(none)_ | Local-side TLS certificate: PEM file path or inline PEM. With `tls_private_key`, enables HTTPS on the listen port. |
+| `tls_private_key` | string | _(none)_ | Private key for `tls_certificate` (PEM file path or inline PEM). HTTPS is enabled only when both are set. |
 | `interface` | string | _(none)_ | Default upstream-facing network interface. |
 | `timeout_ms` | number | `900000` | Default overall upstream timeout in milliseconds. |
 | `connect_timeout_ms` | number | `10000` | Default upstream connect timeout in milliseconds. |
@@ -266,6 +276,29 @@ Two headers get special treatment:
 
 - **`Origin`** (request) is swapped for the upstream's own origin so the upstream sees a same-origin request. A per-upstream `Origin` override wins if present.
 - **`Access-Control-Allow-Origin`** (response) is swapped for the configured CORS value: a per-upstream `response_headers` override first, then `--access-control-allow-origin`, then `*`.
+
+### Local-side HTTPS
+
+Set `tls_certificate` and `tls_private_key` (as config keys or via `--tls-cert`/`--tls-key`) to serve HTTPS on the listen port. Each value is a PEM **file path** or an **inline PEM string**. Both must be set to enable HTTPS; setting only one is rejected at startup (`TlsConfigIncomplete`). Cert/key material is parsed and validated once at startup — a bad path, unreadable file, or unparsable PEM fails fast instead of breaking the first handshake.
+
+The listen port then serves **both** protocols at once: every connection is classified from its first bytes (a TLS record starts `0x16 0x03 0x0x`, HTTP requests start with ASCII letters), TLS handshakes get wrapped in the proxy, and plain HTTP passes through unchanged. There is no separate HTTPS port and no redirect.
+
+Scope of the TLS support:
+
+- **TLS 1.3 only** on the local side (httpx's native TLS server engine; pure Zig, so vendored/static builds are unaffected). Very old TLS 1.0/1.1-only clients cannot connect.
+- **HTTP/1.1 only**: ALPN is pinned to `http/1.1` (never `h2`), so clients never end up speaking HTTP/2 framing to the HTTP/1.1-only forwarder.
+- Failed handshakes (port scanners, probes, TLS versions the engine rejects) are logged at info level and the connection is closed; they are treated as routine noise, not errors.
+
+Self-signed dev cert for a quick try:
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+  -keyout server.key -out server.crt -days 30 -nodes \
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+./zig build run -- --port=8443 --upstream-host=http://127.0.0.1:8081 \
+  --tls-cert=server.crt --tls-key=server.key
+curl --cacert server.crt https://127.0.0.1:8443/   # also still plain: curl http://127.0.0.1:8443/
+```
 
 ### `auto` protocol mode
 

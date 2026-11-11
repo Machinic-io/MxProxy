@@ -44,6 +44,8 @@ const USAGE =
     "  --config-json=<json>                       Inline JSON config (top-level keys)\n" ++
     "  --port=<port>                              Listen port (default: 8080)\n" ++
     "  --bind=<ip>                                Listen address (default: all interfaces)\n" ++
+    "  --tls-cert=<path>                          TLS certificate (PEM file or inline PEM); enables HTTPS on the listen port, which also serves plain HTTP\n" ++
+    "  --tls-key=<path>                           TLS private key (PEM file or inline PEM); required with --tls-cert\n" ++
     "  --timeout=<ms>                             Default overall upstream timeout (default: 900000)\n" ++
     "  --connect-timeout=<ms>                     Upstream connect timeout (default: 10000)\n" ++
     "  --insecure                                 Skip upstream TLS certificate verification\n" ++
@@ -75,6 +77,7 @@ fn configErrorDetail(err: anyerror) ?[]const u8 {
         config_mod.ConfigError.ConfigFileNotFound => "config file not found",
         config_mod.ConfigError.InvalidConfig => "invalid config",
         config_mod.ConfigError.ConnectTimeoutNotLessThanOverall => "overall timeout must be greater than the connect timeout",
+        config_mod.ConfigError.TlsConfigIncomplete => "a TLS certificate is configured without a private key (or a key without a certificate)",
         else => null,
     };
 }
@@ -102,6 +105,8 @@ pub fn main(init: std.process.Init) !void {
     var config_json: ?[]const u8 = null;
     var port_override: ?u16 = null;
     var bind_override: ?[]const u8 = null;
+    var tls_cert_override: ?[]const u8 = null;
+    var tls_key_override: ?[]const u8 = null;
     var timeout_override: ?usize = null;
     var connect_timeout_override: ?usize = null;
     var insecure_override = false;
@@ -121,6 +126,10 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.startsWith(u8, arg, "--bind=")) {
             const value = valueAfter(arg);
             bind_override = if (value.len > 0) value else null;
+        } else if (std.mem.startsWith(u8, arg, "--tls-cert=")) {
+            tls_cert_override = valueAfter(arg);
+        } else if (std.mem.startsWith(u8, arg, "--tls-key=")) {
+            tls_key_override = valueAfter(arg);
         } else if (std.mem.startsWith(u8, arg, "--timeout=")) {
             timeout_override = std.fmt.parseInt(usize, valueAfter(arg), 10) catch return MainError.InvalidTimeout;
         } else if (std.mem.startsWith(u8, arg, "--connect-timeout=")) {
@@ -158,6 +167,8 @@ pub fn main(init: std.process.Init) !void {
     // Explicit CLI overrides take precedence over the config sources.
     if (port_override) |p| config.port = p;
     if (bind_override) |b| config.bind_address = b;
+    if (tls_cert_override) |c| config.tls_certificate = c;
+    if (tls_key_override) |k| config.tls_private_key = k;
     if (timeout_override) |t| config.timeout_ms = t;
     if (connect_timeout_override) |t| config.connect_timeout_ms = t;
     if (insecure_override) config.insecure = true;
@@ -190,6 +201,7 @@ pub fn main(init: std.process.Init) !void {
     if (verbose) {
         log.info("verbose logging enabled", .{});
         log.info("bind {s}", .{if (config.bind_address) |b| b else "0.0.0.0 (default)"});
+        log.info("tls {s}", .{if (config.tls_certificate != null) "enabled (https + http on the listen port)" else "disabled"});
         log.info("interface {s}", .{if (config.interface) |i| i else "(default)"});
         log.info("default overall timeout {d}ms", .{config.timeout_ms});
         log.info("default connect timeout {d}ms", .{config.connect_timeout_ms});
