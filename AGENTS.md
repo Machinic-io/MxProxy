@@ -2,26 +2,32 @@
 
 ## Toolchain: build with Zig 0.17.1
 
-The dependencies (`httpx` 0.2.3+ and `zig-curl` v0.6.0) declare
-`minimum_zig_version =
-"0.17.0"`, but the project itself requires `0.17.1` (its own
+The dependencies (`httpx` 0.2.3, `zig-curl` v0.6.0, `zig-regex` 0.2.1) declare
+`minimum_zig_version = "0.17.0"`, but the project itself requires `0.17.1` (its own
 `minimum_zig_version`; the 0.17.1 bug-fix release resolves the 0.17.0
 regressions and its `zig fmt` is the canonical formatter), so the project only
 builds under Zig 0.17.1+.
 
 - Build/test with the project-local wrapper: `./zig build`, `./zig build test`.
 - It pins to a 0.17.1+ toolchain (set `ZIG_17` to override, e.g. `/snap/zig/17198/zig`).
-- Both deps are **local path dependencies** in `build.zig.zon`:
-  `curl -> ../zig-curl` and `httpx -> ../httpx.zig`. They must exist as siblings
-  of this checkout. If a sibling is missing, the `./zig` wrapper clones it from
-  GitHub at the pinned commit before building (override the pin via the
-  `ZIG_CURL_REF`/`HTTPX_REF` env vars). A sibling that has a `build.zig.zon` is
-  treated as present and left alone, so a local pin/edit survives; CI still
-  checks both out as siblings, so the bootstrap is a no-op there.
-- Do not switch `httpx` back to a URL dep: GitHub tarballs extract to a nested
-  `httpx.zig-X/` wrapper that Zig 0.17's build graph hashes incorrectly
-  (`N-V-__...` content hash), so the pinned hash never matches. The bootstrap
-  uses `git clone` (not a tarball) precisely to avoid that wrapper.
+- All three deps are **URL dependencies** in `build.zig.zon` (GitHub
+  `archive/<commit>.tar.gz` pins with content hashes `curl-0.6.0-…`,
+  `httpx-0.2.3-…`, `zig_regex-0.2.1-…`). `./zig build` fetches them
+  automatically; a fresh clone needs no setup and CI checks out no siblings.
+- Bump a dep with `./zig fetch --save=<name> <archive-url>` and commit the
+  zon diff. Gotcha: `zig fetch --save` *overwriting an existing path dep*
+  writes the URL into the `.path` field and drops `.hash` (invalid manifest) —
+  clear the entry (or `.dependencies`) first, then fetch.
+- Develop against a local dep checkout with Zig's fork override:
+  `./zig build test --fork=../zig-curl` (the fork is matched by the package
+  name in its own zon; the old `--dep` flag no longer exists in 0.17).
+- History: the deps were sibling path deps (`../zig-curl` etc., bootstrapped by
+  the old `./zig` wrapper and CI checkout steps) because a GitHub-tarball URL
+  dep reportedly hashed to a wrong `N-V-__…` content hash. That does not
+  reproduce on 0.17.1 — fetch, hash check, compile and link all pass for all
+  three pins (likely a 0.17.0 regression, or a non-`archive/<sha>.tar.gz` URL
+  form). If a future Zig regresses tarball hashing again, re-verify before
+  reintroducing path deps.
 
 ## Zig 0.17 language/toolchain quirks in this codebase
 

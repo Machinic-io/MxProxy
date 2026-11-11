@@ -6,13 +6,16 @@
     .paths = .{""},
     .dependencies = .{
         .curl = .{
-            .path = "../zig-curl",
+            .url = "https://github.com/jiacai2050/zig-curl/archive/0bc73f43cbd736fb7801b31b91c2ea0cca145c67.tar.gz",
+            .hash = "curl-0.6.0-P4tT4ffzAgB1AzmYo7Rt92sP2w3GKcSvr36ISpuJ43sL",
         },
         .httpx = .{
-            .path = "../httpx.zig",
+            .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/cbed04b165d3301e5fa9ff7339f64072c57bc8cb.tar.gz",
+            .hash = "httpx-0.2.3-8qj2eiizJgGW9N7axHatCi9mATfzViM7_kGb4UGo_04K",
         },
         .regex = .{
-            .path = "../zig-regex",
+            .url = "https://github.com/zig-utils/zig-regex/archive/16df9870ca4a4ec8d0b932e90a62a8b3fb9af563.tar.gz",
+            .hash = "zig_regex-0.2.1-omky0XpKGwAtdEvHWpryg6oE2rs1j5VuYkzU61ETnnEG",
         },
     },
 }
