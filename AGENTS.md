@@ -88,6 +88,17 @@ Confirmed against the 0.17.1 toolchain. Avoid these (they do not compile):
   `"http2"` protocol is refused at startup. This is why the release (vendored)
   binaries are HTTP/1.1-only upstream while dev/system-libcurl builds can do
   HTTP/2. Do not "fix" this by assuming `auto` always requests 2TLS.
+- **httpx 0.2.3 `tls.Server` validates a file-path identity but serves the raw
+  config string.** `Server.init` resolves path-or-inline-PEM through
+  `loadPemOrFile` for its fail-fast validation, but the handshake path
+  (`resolveIdentity` → `produceServerFlight`) uses `config.certificatePem`/
+  `privateKeyPem` verbatim — with a path, the CertificateVerify key parser is
+  handed the path text and every TLS connection dies with
+  `error.ProtocolViolation` (the server starts fine; only handshakes fail).
+  `server.zig` therefore resolves path→PEM content itself (`loadPemOrPath`)
+  *before* `tls.Server.init`; the regression test is
+  `integration: tls material loads from file paths`, which must drive a real
+  TLS handshake (a plain-HTTP probe passes against the broken form).
 
 ## Release / binary size
 
@@ -122,6 +133,8 @@ Confirmed against the 0.17.1 toolchain. Avoid these (they do not compile):
 - `src/router.zig` — path rewrite (plain prefix now; extensible to regex).
 - `src/forward.zig` — the proxy core (parse request, drive libcurl directly).
 - `src/server.zig` — accept loop, thread-per-connection, shutdown.
+- `src/stream.zig` — client-connection abstraction (plain TCP socket or
+  TLS-wrapped connection; maps read/write faults to `error.ClientClosed`).
 - `src/headers.zig` — hop-by-hop filtering + header override application.
 - `test/proxy_test.zig` — config unit tests + in-process integration tests.
 - `test/router_test.zig` — router/rewrite unit tests (path-rewrite +

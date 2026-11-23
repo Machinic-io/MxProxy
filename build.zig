@@ -85,6 +85,15 @@ pub fn build(b: *std.Build) void {
     });
     mod_headers.addImport("httpx", httpx_module);
 
+    // stream — the client-connection abstraction (plain TCP or TLS-wrapped)
+    // shared by the accept loop (server) and the proxy core (forward).
+    const mod_stream = b.addModule("stream", .{
+        .root_source_file = b.path("src/stream.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mod_stream.addImport("httpx", httpx_module);
+
     // forward — the core proxy: parse request, resolve route, drive one curl easy.
     const mod_forward = b.addModule("forward", .{
         .root_source_file = b.path("src/forward.zig"),
@@ -95,6 +104,7 @@ pub fn build(b: *std.Build) void {
     mod_forward.addImport("config", mod_config);
     mod_forward.addImport("router", mod_router);
     mod_forward.addImport("headers", mod_headers);
+    mod_forward.addImport("stream", mod_stream);
     mod_forward.addImport("httpx", httpx_module);
     mod_forward.addImport("curl", curl_module);
 
@@ -108,6 +118,7 @@ pub fn build(b: *std.Build) void {
     mod_server.addImport("config", mod_config);
     mod_server.addImport("router", mod_router);
     mod_server.addImport("forward", mod_forward);
+    mod_server.addImport("stream", mod_stream);
     mod_server.addImport("httpx", httpx_module);
 
     // main — entry point: CLI + config, globalInit, start the server.
@@ -150,6 +161,7 @@ pub fn build(b: *std.Build) void {
     test_module.addImport("headers", mod_headers);
     test_module.addImport("forward", mod_forward);
     test_module.addImport("server", mod_server);
+    test_module.addImport("stream", mod_stream);
     test_module.addImport("httpx", httpx_module);
     test_module.addImport("curl", curl_module);
 
