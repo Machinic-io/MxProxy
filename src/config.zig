@@ -161,8 +161,9 @@ pub const Config = struct {
     arena: std.heap.ArenaAllocator,
 
     port: u16 = 8080,
-    /// Client-facing listen address (e.g. "127.0.0.1"). `null` means all
-    /// interfaces (0.0.0.0). Set by `--bind`.
+    /// Client-facing listen address (e.g. "0.0.0.0" for all interfaces).
+    /// `null` — the default — binds loopback only (127.0.0.1); exposing the
+    /// proxy to the network is an explicit operator decision. Set by `--bind`.
     bind_address: ?[]const u8 = null,
     /// Default upstream-facing interface (see `Upstream.interface`).
     interface: ?[]const u8 = null,

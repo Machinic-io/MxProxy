@@ -1899,3 +1899,33 @@ test "server: requestShutdown reports a repeat signal" {
     try std.testing.expect(!server.requestShutdown());
     try std.testing.expect(server.requestShutdown());
 }
+
+test "server: default bind is loopback, not all interfaces" {
+    const allocator = std.heap.page_allocator;
+    var io_ctx = try httpx.IoContext.init(std.testing.allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io;
+
+    var upstream = tcp.Listener.bind(io, 0) catch return IntError.BindFailed;
+    defer upstream.close(io);
+    var relay = try relaySetup(io, allocator, upstream.localPort());
+    defer relay.cfg.deinit();
+
+    // bind_address left at its default (null): the listener must land on
+    // loopback, not 0.0.0.0. The safe default is an operator-facing promise,
+    // so pin it here, not just in the docs.
+    var server = server_mod.Server.init(&relay.forwarder, allocator, io);
+    server.port = 0;
+    const server_thread = try std.Thread.spawn(.{}, serverRun, .{&server});
+    var spins: u32 = 0;
+    while (server.bound_address.port == 0 and spins < 1000000) {
+        std.Thread.yield() catch {};
+        spins += 1;
+    }
+    if (server.bound_address.port == 0) return error.ServerBindTimeout;
+    var addr_buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("127.0.0.1", server.bound_address.formatBuf(&addr_buf));
+
+    _ = server.requestShutdown(); // wake the accept loop so the thread joins
+    server_thread.join();
+}

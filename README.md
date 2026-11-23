@@ -160,6 +160,7 @@ Or from a config file:
 | `--config=<path>` | Path to a JSON config file. |
 | `--config-json=<json>` | Inline JSON config (top-level keys only). |
 | `--port=<u16>` | Listen port (default `8080`). |
+| `--bind=<ip>` | Listen address (default `127.0.0.1`, loopback only). Use `0.0.0.0` to listen on all interfaces. |
 | `--timeout=<ms>` | Default overall upstream timeout in milliseconds (default `900000`). A per-upstream `timeout_ms` still overrides it. |
 | `--connect-timeout=<ms>` | Upstream connect timeout in milliseconds (default `10000`). A per-upstream `connect_timeout_ms` still overrides it. |
 | `--insecure` | Skip TLS certificate verification for all upstreams. A per-upstream `insecure` still overrides it. |
@@ -211,6 +212,7 @@ All fields are optional; omitted fields fall back to their defaults.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `port` | number | `8080` | Port to listen on. |
+| `bind_address` | string | `127.0.0.1` | Listen address. `0.0.0.0` listens on all interfaces. |
 | `interface` | string | _(none)_ | Default upstream-facing network interface. |
 | `timeout_ms` | number | `900000` | Default overall upstream timeout in milliseconds. |
 | `connect_timeout_ms` | number | `10000` | Default upstream connect timeout in milliseconds. |

@@ -43,7 +43,7 @@ const USAGE =
     "  --config=<path>                            Path to a JSON config file\n" ++
     "  --config-json=<json>                       Inline JSON config (top-level keys)\n" ++
     "  --port=<port>                              Listen port (default: 8080)\n" ++
-    "  --bind=<ip>                                Listen address (default: all interfaces)\n" ++
+    "  --bind=<ip>                                Listen address (default: 127.0.0.1 loopback only; use 0.0.0.0 for all interfaces)\n" ++
     "  --timeout=<ms>                             Default overall upstream timeout (default: 900000)\n" ++
     "  --connect-timeout=<ms>                     Upstream connect timeout (default: 10000)\n" ++
     "  --insecure                                 Skip upstream TLS certificate verification\n" ++
@@ -189,7 +189,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (verbose) {
         log.info("verbose logging enabled", .{});
-        log.info("bind {s}", .{if (config.bind_address) |b| b else "0.0.0.0 (default)"});
+        log.info("bind {s}", .{if (config.bind_address) |b| b else "127.0.0.1 (loopback, default)"});
         log.info("interface {s}", .{if (config.interface) |i| i else "(default)"});
         log.info("default overall timeout {d}ms", .{config.timeout_ms});
         log.info("default connect timeout {d}ms", .{config.connect_timeout_ms});

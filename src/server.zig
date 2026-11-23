@@ -34,7 +34,8 @@ pub const Server = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     port: u16,
-    /// Client-facing listen address; `null` means all interfaces (0.0.0.0).
+    /// Client-facing listen address; `null` means loopback (127.0.0.1) — the
+    /// safe default. All interfaces (0.0.0.0) must be requested explicitly.
     bind_address: ?[]const u8 = null,
     /// The resolved address actually bound in run(); used to wake accept().
     /// Defaults to any/0 so a signal before run() binds stays harmless.
@@ -107,7 +108,10 @@ pub const Server = struct {
                     return error.InvalidBindAddress;
                 };
             } else {
-                break :blk address.Address.unspecified4(self.port);
+                // Default: loopback only. A reverse proxy on 0.0.0.0 by
+                // default would expose the upstream to the network without
+                // any operator decision; `--bind=0.0.0.0` opts in explicitly.
+                break :blk address.Address.loopback4(self.port);
             }
         };
         bind_addr.port = self.port;
