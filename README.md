@@ -134,6 +134,51 @@ libcurl has **no HTTP/2** (no nghttp2): in the two `-vendored` artifacts,
 `"http2"` protocol is rejected with a startup error. All release binaries
 are stripped.
 
+### Building without a network fetch
+
+`./zig build` fetches the dependencies pinned in `build.zig.zon` with Zig's own
+HTTP/TLS client, and that client reads trust anchors from fixed places only: six
+hard-coded bundle files on Linux, `SystemRootCertificates.keychain` plus
+`/Library/Keychains/System.keychain` on macOS. It ignores `SSL_CERT_FILE` and
+`SSL_CERT_DIR` entirely. So a machine whose trust store is set up for
+OpenSSL/curl, or one behind a TLS-intercepting proxy whose root certificate sits
+somewhere Zig does not look, fails the fetch with a catch-all that hides the
+reason:
+
+```
+./build.zig.zon:9:20: error: invalid HTTP response: TlsInitializationFailed
+```
+
+`tools/seed-deps.sh` downloads the same pinned archives with **curl**, which does
+use the system trust store, and unpacks each one into the project-local package
+cache at `zig-pkg/<hash>`. The build checks that directory before the global
+cache and before the network, so once it is populated no fetch — and no Zig TLS —
+is involved at all:
+
+```sh
+bash tools/seed-deps.sh    # from the project root
+./zig build
+```
+
+- The script reads the URLs and hashes out of the manifests themselves and walks
+  the dependency tree, so it follows the pins wherever they point rather than
+  hard-coding any URL. Re-run it after a dependency bump.
+- It fetches every declared dependency, including zig-curl's `lazy`
+  curl/zlib/mbedtls entries, so `./zig build -Dlink_vendor=true` also works
+  offline.
+- `zig-pkg/` is about 123 MB unpacked and gitignored, so it never dirties the
+  tree.
+- Do **not** hand-place tarballs in `~/.cache/zig/p/<hash>.tar.gz`. On 0.17.1 the
+  global-cache read path re-hashes a package without its name and version and
+  fails with `hash mismatch: … N-V-__…`, even for a file byte-identical to the
+  one Zig wrote there. `zig-pkg/<hash>` is the path that works.
+- Repairing the trust store is still the better fix. On macOS a root certificate
+  has to be in `/Library/Keychains/System.keychain` for Zig to see it
+  (`sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ca.pem`);
+  installing it in the login keychain makes it visible to curl but not to Zig.
+  On Linux the bundle Zig uses is the *first* of those six paths that exists, so
+  a zero-byte `/etc/ssl/certs/ca-certificates.crt` shadows every other source.
+
 ## Running
 
 MxProxy is configured by a JSON config file, an inline JSON string, and/or command-line flags. Precedence (lowest → highest):

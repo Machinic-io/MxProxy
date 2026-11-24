@@ -29,11 +29,20 @@ builds under Zig 0.17.1+.
   name in its own zon; the old `--dep` flag no longer exists in 0.17).
 - History: the deps were sibling path deps (`../zig-curl` etc., bootstrapped by
   the old `./zig` wrapper and CI checkout steps) because a GitHub-tarball URL
-  dep reportedly hashed to a wrong `N-V-__…` content hash. That does not
-  reproduce on 0.17.1 — fetch, hash check, compile and link all pass for all
-  three pins (likely a 0.17.0 regression, or a non-`archive/<sha>.tar.gz` URL
-  form). If a future Zig regresses tarball hashing again, re-verify before
-  reintroducing path deps.
+  dep reportedly hashed to a wrong `N-V-__…` content hash. The **fetch** does not
+  reproduce that on 0.17.1 — fetch, hash check, compile and link all pass for all
+  three pins, and `zig fetch` on the same tarball prints the pinned hash. What
+  does reproduce is reading a URL dep back *out of* the global cache:
+  `Maker/Fetch.zig` re-hashes `p/<hash>.tar.gz` without the package name and
+  version, so a cold build against a populated cache fails with `hash mismatch:
+  … but the fetched package has N-V-__…` — even when the file is byte-identical
+  to the one Zig itself stored there (measured with `zig build` inside a network
+  namespace, so there is no fallback to the network to blame). Two consequences:
+  seeding `~/.cache/zig/p` is **not** an offline workaround, and `p/` cannot be
+  relied on for offline builds at all. The project-local `zig-pkg/<hash>`
+  directory is checked before `p/` and does satisfy a fully offline build — that
+  is what `tools/seed-deps.sh` fills. Re-verify both paths on the next toolchain
+  bump.
 
 ## Zig 0.17 language/toolchain quirks in this codebase
 
@@ -125,6 +134,13 @@ Confirmed against the 0.17.1 toolchain. Avoid these (they do not compile):
   `test/router_test.zig`). Both are separate test roots wired to the `test`
   step in `build.zig`.
 - `./zig build run -- <args>` — run the proxy with args (e.g. `--port=8080`).
+- `bash tools/seed-deps.sh` — download every pinned dependency with **curl** into
+  `zig-pkg/<hash>` (URLs and hashes read from the manifests, tree walked). For
+  machines where the Zig fetch can't verify the server certificate
+  (`invalid HTTP response: TlsInitializationFailed`): the build checks `zig-pkg/`
+  before the global cache and before the network, so afterwards it needs no fetch
+  and no Zig TLS. ~123 MB unpacked, gitignored; covers the lazy curl/zlib/mbedtls
+  deps, so `-Dlink_vendor=true` works offline too.
 
 ## Layout
 
